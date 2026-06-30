@@ -61,11 +61,50 @@ def _fill_template(winner: Candidate, expr: Expression, history: list[dict]) -> 
     return text
 
 
+# ---- 컨텍스트 조립 (소스층 수치 -> LLM 지시문) ------------------------------
+# 어펙트 엔진이 결정한 종합 수치를 "행동 지시"로 번역한다.
+# 숫자만 던지면 모델이 잘 안 따르므로, 각 수치를 관계/기분/태도 directive 로 푼다.
+
+def _intimacy_stage(intimacy: float) -> tuple[str, str]:
+    """친밀도 누적치 -> 관계 단계 + 말투 지시. 대화감을 지배하는 핵심 변수."""
+    if intimacy < 1.0:
+        return "초면", "아직 서먹하다. 거리를 두고, 사적인 건 깊이 안 묻는다."
+    if intimacy < 3.0:
+        return "알아가는 중", "조금씩 마음을 연다. 가벼운 반말, 관심은 보이되 과하지 않게."
+    if intimacy < 6.0:
+        return "친한 사이", "편한 반말에 장난도 친다. 상대 일에 적극 공감한다."
+    return "절친", "아주 가깝다. 거침없는 반말과 애칭, 깊이 챙기고 공감한다."
+
+
+def _mood_word(E: float) -> str:
+    if E > 0.25:
+        return "기분이 좋다"
+    if E > -0.25:
+        return "평온하다"
+    return "기분이 가라앉아 있다"
+
+
+def build_context(winner, state, expr, cfg) -> tuple[str, str]:
+    """소스층(어펙트 엔진) 결과 -> (system, user). 수치가 곧 대화 톤을 지배한다."""
+    stage, stage_dir = _intimacy_stage(state.intimacy)
+    system = "\n".join([
+        f"너는 '{cfg.name}'({cfg.archetype}) 라는 캐릭터다.",
+        f"[관계] 친밀도 {state.intimacy:.1f} → '{stage}'. {stage_dir}",
+        f"[기분] 정서 E={state.E:+.2f} → {_mood_word(state.E)}. "
+        f"세기 A={state.A:.2f} → 에너지는 '{expr.energy}'.",
+        f"[태도] 열기 {state.openness:.2f} → 말투 톤은 '{expr.tone}'. 표정 {expr.face}.",
+        "위 수치가 곧 너의 현재 상태다. 수치에 충실하게 한국어로 1~2문장만 말해라.",
+    ])
+    user_text = winner.payload.get("text", winner.kind)
+    return system, user_text
+
+
 def _mock_llm(winner, state, expr, cfg) -> str:
     """키 없이 루프를 돌리기 위한 결정론 스텁. 실제로는 call_haiku() 사용."""
     topic = winner.payload.get("text", winner.kind)
+    stage, _ = _intimacy_stage(state.intimacy)
     tone = {"warm": "따뜻하게", "neutral": "담담하게", "distant": "짧고 거리 두고"}[expr.tone]
-    return f"[mock-haiku {tone}] ({cfg.name}) \"{topic}\"에 대한 즉흥 응답"
+    return f"[mock-haiku {tone}/{stage}] ({cfg.name}) \"{topic}\"에 대한 즉흥 응답"
 
 
 def respond(winner, state, expr, cfg, history, use_llm=_mock_llm):
@@ -87,12 +126,7 @@ def call_haiku(winner, state, expr, cfg) -> str:
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY 없음 — 라이브 호출 불가")
 
-    system = (
-        f"너는 '{cfg.name}'({cfg.archetype}). "
-        f"현재 기분 E={state.E:+.2f} A={state.A:.2f} 열기={state.openness:.2f}. "
-        f"톤={expr.tone}, 에너지={expr.energy}. 이 상태에 맞춰 한국어로 1~2문장."
-    )
-    user_text = winner.payload.get("text", winner.kind)
+    system, user_text = build_context(winner, state, expr, cfg)
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={"x-api-key": key, "anthropic-version": "2023-06-01",
