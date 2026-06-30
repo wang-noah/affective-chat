@@ -277,6 +277,9 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   <input type=text id=text value="오늘 회사에서 진짜 짜증났어">
 
   <div class=chk><input type=checkbox id=live><label for=live style="margin:0">라이브 (API 키 필요)</label></div>
+
+  <button id=send style="margin-top:20px;background:#238636;border-color:#2ea043;color:#fff;font-size:14px;font-weight:700;padding:11px">▶ SEND — 한 턴 실행</button>
+  <div id=hint style="font-size:11px;color:#8b949e;margin-top:8px;text-align:center;min-height:14px"></div>
  </div>
 
  <div class=out>
@@ -345,35 +348,39 @@ function render(d){
   $('mode').textContent=d.mode;
   lastResult=d.trace_result;
 }
-let t;
-function update(){
+function setHint(m){$('hint').textContent=m;}
+function syncLabels(){           // 숫자 표시만 즉시 갱신 (네트워크 X)
   $('Ev').textContent=(+$('E').value).toFixed(2);
   $('Av').textContent=(+$('A').value).toFixed(2);
   $('ov').textContent=(+$('openness').value).toFixed(2);
   $('iv').textContent=(+$('intimacy').value).toFixed(1);
   $('i1v').textContent=(+$('int1').value).toFixed(2);
   $('i2v').textContent=(+$('int2').value).toFixed(2);
-  clearTimeout(t);
-  t=setTimeout(()=>{
-    const p=new URLSearchParams({
-      E:$('E').value,A:$('A').value,openness:$('openness').value,
-      intimacy:$('intimacy').value,kind:$('kind').value,kind2:$('kind2').value,
-      int1:$('int1').value,int2:$('int2').value,text:$('text').value,
-      live:$('live').checked?'1':'0'});
-    fetch('/api/compute?'+p).then(r=>r.json()).then(render);
-  },150);
 }
-ids.forEach(id=>$(id).addEventListener('input',update));
+function run(){                  // SEND: 실제 한 턴 로직 실행
+  syncLabels();
+  setHint('계산 중…');
+  const p=new URLSearchParams({
+    E:$('E').value,A:$('A').value,openness:$('openness').value,
+    intimacy:$('intimacy').value,kind:$('kind').value,kind2:$('kind2').value,
+    int1:$('int1').value,int2:$('int2').value,text:$('text').value,
+    live:$('live').checked?'1':'0'});
+  fetch('/api/compute?'+p).then(r=>r.json()).then(d=>{render(d);setHint('');});
+}
+// 입력 변경 시: 라벨만 갱신 + "변경됨" 표시 (계산은 SEND 때만)
+ids.forEach(id=>$(id).addEventListener('input',()=>{syncLabels();setHint('● 입력 변경됨 — SEND 를 누르세요');}));
+$('text').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();run();}});
+$('send').addEventListener('click',run);
 $('autoOpen').addEventListener('click',()=>{
   const i=+$('intimacy').value, b=1/(1+Math.exp(-(i-5)/2));
-  $('openness').value=b.toFixed(2); update();
+  $('openness').value=b.toFixed(2); syncLabels(); setHint('● 입력 변경됨 — SEND 를 누르세요');
 });
-$('applyTurn').addEventListener('click',()=>{
+$('applyTurn').addEventListener('click',()=>{   // 결과 상태를 슬라이더로 옮기고, SEND 로 다음 턴
   if(!lastResult)return;
   $('E').value=lastResult.E; $('A').value=lastResult.A; $('openness').value=lastResult.openness;
-  update();
+  syncLabels(); setHint('● 결과 상태 적용됨 — SEND 로 다음 턴 실행');
 });
-update();
+syncLabels(); run();            // 첫 로드 1회만 실행
 </script></html>"""
 
 
