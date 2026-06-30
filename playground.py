@@ -99,6 +99,54 @@ def trace_turn(state: AffectState, pool: list, cfg, dt: float = 1.0):
     return "\n".join(arb), "\n".join(aff), result
 
 
+# ---- 데모 응답 뱅크 (키 없이도 LLM 경로에서 그럴듯한 대사) -------------------
+# 자유 발화는 원래 LLM 이 만든다. 키 없는 데모용으로, Claude 가 친밀도 단계별로
+# 미리 써둔 대사를 주입한다(= 방식 A 를 패널에 내장). 정형 발화는 chat.respond 의
+# T1 템플릿이 실제 텍스트를 만들므로 여기 안 들어온다.
+DEMO_LINES = {
+    "user_distress": {
+        "초면": "아 그래...? 무슨 일 있었는데.",
+        "알아가는 중": "엥 뭔데, 무슨 일 있었어?",
+        "친한 사이": "헐 왜, 무슨 일 있었어? 짜증 제대로 났나 보네.",
+        "절친": "아우 또 뭔데~ 어떤 놈이 우리 열받게 한 거야, 다 말해봐.",
+    },
+    "smalltalk": {
+        "초면": "음, 그렇구나.",
+        "알아가는 중": "오 그래? 좀 더 얘기해봐.",
+        "친한 사이": "ㅋㅋ 뭐야 그게, 재밌네.",
+        "절친": "야 그거 완전 너답다 ㅋㅋㅋ 더 풀어봐~",
+    },
+    "compliment": {
+        "초면": "어... 고마워.",
+        "알아가는 중": "헤, 그런 말 들으니까 좋네.",
+        "친한 사이": "뭐야~ 갑자기 칭찬이야? 기분 좋다 ㅋㅋ",
+        "절친": "아 진짜? 너밖에 없다 진짜~ 좋아 죽겠네 ㅋㅋ",
+    },
+    "insult": {
+        "초면": "...뭐라는 거야.",
+        "알아가는 중": "어이없네. 왜 그래 갑자기.",
+        "친한 사이": "야 너 진짜 ㅋㅋ 선 넘지 말고.",
+        "절친": "또 시작이네 ㅋㅋ 너니까 봐준다.",
+    },
+    "game_negative": {
+        "초면": "아 졌네... 별로다.",
+        "알아가는 중": "아 방금 그거 던졌어, 봤어?",
+        "친한 사이": "아 미쳤다 진짜 왜 저기서 짤려 ㅠㅠ",
+        "절친": "야야 봤어?? 한타 그거 개답답해 진짜 ㅋㅋㅋ",
+    },
+}
+_TONE_FALLBACK = {"distant": "...그렇구나.", "neutral": "음, 그래.",
+                  "warm": "오~ 그래그래, 더 말해봐!"}
+
+
+def _demo_llm(winner, state, expr, cfg) -> str:
+    stage, _ = chat._intimacy_stage(state.intimacy)
+    bank = DEMO_LINES.get(winner.kind)
+    if bank and stage in bank:
+        return bank[stage]
+    return _TONE_FALLBACK.get(expr.tone, "음, 그래.")
+
+
 def compute(q: dict) -> dict:
     def f(name, default):
         try:
@@ -130,13 +178,17 @@ def compute(q: dict) -> dict:
     stage, stage_dir = chat._intimacy_stage(intimacy)
     arbiter_log, affect_log, trace_result = trace_turn(state, pool, CFG)
 
-    mode, dialogue = "mock", chat._mock_llm(primary, state, expr, CFG)
+    # 실제 스킵 게이트(chat.respond)를 거친다: 정형=T1 템플릿(실제 텍스트), 자유=LLM
     if live:
         try:
-            dialogue = chat.call_haiku(primary, state, expr, CFG)
-            mode = "live (haiku)"
-        except Exception as e:  # 키 없음/네트워크 등 -> mock 으로 폴백
-            mode = f"mock (라이브 실패: {e})"
+            dialogue, route = chat.respond(primary, state, expr, CFG, [], use_llm=chat.call_haiku)
+            mode = f"live (haiku) · route={route}"
+        except Exception as e:  # 키/requests 없음 -> 데모 응답으로 폴백
+            dialogue, route = chat.respond(primary, state, expr, CFG, [], use_llm=_demo_llm)
+            mode = f"데모 (라이브 실패: {e}) · route={route}"
+    else:
+        dialogue, route = chat.respond(primary, state, expr, CFG, [], use_llm=_demo_llm)
+        mode = f"데모(curated) · route={route}"
 
     return {
         "face": expr.face, "energy": expr.energy, "tone": expr.tone,
