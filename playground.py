@@ -169,6 +169,30 @@ def _demo_llm(winner, state, expr, cfg) -> str:
     return line
 
 
+# ---- 메시지 키워드 → kind 자동 분류 (간이 룰베이스) -------------------------
+# 우선순위 순서대로 검사. 실제 시스템에선 소스층/Appraisal 이 담당할 영역의 데모.
+_KEYWORDS = [
+    ("insult",           ["바보", "멍청", "꺼져", "닥쳐", "못생", "미워", "재수", "한심", "찌질"]),
+    ("compliment",       ["고마", "멋지", "멋있", "예뻐", "예쁘", "최고", "잘했", "대단", "사랑",
+                          "좋아해", "귀여", "짱", "고생했"]),
+    ("user_distress",    ["짜증", "힘들", "힘드", "우울", "슬퍼", "슬프", "화나", "열받", "지쳐",
+                          "지친", "속상", "스트레스", "죽겠", "빡쳐", "눈물", "외로", "포기"]),
+    ("game_positive",    ["이겼", "이김", "우승", "바론", "드래곤", "에이스", "역전승", "캐리", "승리", "꿀잼"]),
+    ("game_negative",    ["졌", "패배", "던졌", "짤려", "트롤", "망했", "역전패", "지고"]),
+    ("goal_follow_nudge", ["팔로우", "팔로", "follow"]),
+    ("greeting",         ["안녕", "하이", "ㅎㅇ", "안뇽", "왔어", "또 왔", "잘 가", "잘가",
+                          "바이", "ㅂㅂ", "반가", "오랜만"]),
+]
+
+
+def classify_kind(text: str) -> str:
+    t = (text or "").lower()
+    for kind, kws in _KEYWORDS:
+        if any(k.lower() in t for k in kws):
+            return kind
+    return "smalltalk"   # 기본: 잡담 (자유 발화 → LLM 경로)
+
+
 def compute(q: dict) -> dict:
     def f(name, default):
         try:
@@ -186,6 +210,9 @@ def compute(q: dict) -> dict:
     int2 = f("int2", 0.7)
     text = q.get("text", ["오늘 회사에서 진짜 짜증났어"])[0]
     live = q.get("live", ["0"])[0] == "1"
+    auto = q.get("auto", ["0"])[0] == "1"
+    if auto:                       # 메시지 키워드로 kind 덮어쓰기
+        kind = classify_kind(text)
 
     state = AffectState(E=E, A=A, openness=openness, intimacy=intimacy)
     expr = express(state)
@@ -201,16 +228,17 @@ def compute(q: dict) -> dict:
     arbiter_log, affect_log, trace_result = trace_turn(state, pool, CFG)
 
     # 실제 스킵 게이트(chat.respond)를 거친다: 정형=T1 템플릿(실제 텍스트), 자유=LLM
+    ktag = f"kind={kind}{'(자동)' if auto else ''}"
     if live:
         try:
             dialogue, route = chat.respond(primary, state, expr, CFG, [], use_llm=chat.call_haiku)
-            mode = f"live (haiku) · route={route}"
+            mode = f"live (haiku) · {ktag} · route={route}"
         except Exception as e:  # 키/requests 없음 -> 데모 응답으로 폴백
             dialogue, route = chat.respond(primary, state, expr, CFG, [], use_llm=_demo_llm)
-            mode = f"데모 (라이브 실패: {e}) · route={route}"
+            mode = f"데모 (라이브 실패: {e}) · {ktag} · route={route}"
     else:
         dialogue, route = chat.respond(primary, state, expr, CFG, [], use_llm=_demo_llm)
-        mode = f"데모(curated) · route={route}"
+        mode = f"데모(curated) · {ktag} · route={route}"
 
     return {
         "face": expr.face, "energy": expr.energy, "tone": expr.tone,
@@ -219,6 +247,7 @@ def compute(q: dict) -> dict:
         "baseline_openness": round(openness_baseline(intimacy), 3),
         "system": system, "user": user_text,
         "dialogue": dialogue, "mode": mode,
+        "kind_used": kind, "auto": auto,
         "trace_arbiter": arbiter_log, "trace_affect": affect_log,
         "trace_result": trace_result,
     }
@@ -297,6 +326,7 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
 
   <label for=text>유저 발화</label>
   <input type=text id=text value="오늘 회사에서 진짜 짜증났어">
+  <div class=chk><input type=checkbox id=auto checked><label for=auto style="margin:0">메시지 키워드로 kind 자동 분류</label></div>
 
   <div class=chk><input type=checkbox id=live><label for=live style="margin:0">라이브 (API 키 필요)</label></div>
 
@@ -348,7 +378,7 @@ const sel2=$('kind2');
 ['(없음)'].concat(KINDS).forEach(k=>{const o=document.createElement('option');
   o.value=o.textContent=k;if(k==='goal_follow_nudge')o.selected=true;sel2.appendChild(o)});
 
-const ids=['E','A','openness','intimacy','kind','kind2','int1','int2','text','live'];
+const ids=['E','A','openness','intimacy','kind','kind2','int1','int2','text','live','auto'];
 const COLOR={warm:'#f0883e',cool:'#58a6ff'};
 let lastResult=null;
 
@@ -368,8 +398,10 @@ function render(d){
   $('user').textContent='유저: '+d.user;
   $('dialogue').textContent='루나: '+d.dialogue;
   $('mode').textContent=d.mode;
+  if(d.auto){ $('kind').value=d.kind_used; }   // 분류된 kind 를 드롭다운에 반영
   lastResult=d.trace_result;
 }
+function applyAutoUI(){ $('kind').disabled=$('auto').checked; }
 function setHint(m){$('hint').textContent=m;}
 function syncLabels(){           // 숫자 표시만 즉시 갱신 (네트워크 X)
   $('Ev').textContent=(+$('E').value).toFixed(2);
@@ -386,12 +418,13 @@ function run(){                  // SEND: 실제 한 턴 로직 실행
     E:$('E').value,A:$('A').value,openness:$('openness').value,
     intimacy:$('intimacy').value,kind:$('kind').value,kind2:$('kind2').value,
     int1:$('int1').value,int2:$('int2').value,text:$('text').value,
-    live:$('live').checked?'1':'0'});
+    live:$('live').checked?'1':'0',auto:$('auto').checked?'1':'0'});
   fetch('/api/compute?'+p).then(r=>r.json()).then(d=>{render(d);setHint('');});
 }
 // 입력 변경 시: 라벨만 갱신 + "변경됨" 표시 (계산은 SEND 때만)
 ids.forEach(id=>$(id).addEventListener('input',()=>{syncLabels();setHint('● 입력 변경됨 — SEND 를 누르세요');}));
 $('text').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();run();}});
+$('auto').addEventListener('change',applyAutoUI);
 $('send').addEventListener('click',run);
 $('autoOpen').addEventListener('click',()=>{
   const i=+$('intimacy').value, b=1/(1+Math.exp(-(i-5)/2));
@@ -402,7 +435,7 @@ $('applyTurn').addEventListener('click',()=>{   // 결과 상태를 슬라이더
   $('E').value=lastResult.E; $('A').value=lastResult.A; $('openness').value=lastResult.openness;
   syncLabels(); setHint('● 결과 상태 적용됨 — SEND 로 다음 턴 실행');
 });
-syncLabels(); run();            // 첫 로드 1회만 실행
+applyAutoUI(); syncLabels(); run();   // 첫 로드 1회만 실행
 </script></html>"""
 
 
