@@ -1,24 +1,28 @@
 """
-affect_engine.py — 결정론(LLM 0) 코어
-=====================================
-한 턴: update(state, candidates, cfg, dt) -> (new_state, winners, losers)
+affect_engine.py — Affect: 숫자만 받는 순수 함수 (LLM 0)
+=======================================================
+노션 'Arbiter → Affect' 문서의 Affect 책임만 담는다.
 
-salience 와 Arbiter 의 관계:
-  - salience()  : 후보 하나를 비교 가능한 숫자 하나로 환산하는 '화폐'.
-                  자극 / Backlog(묵은 자극) / 목표를 같은 척도로 만든다.
-                  현재 감정 상태(E/A/열기)를 입력으로 받아 끌림을 변조 = 되먹임.
-  - arbitrate() : salience 점수를 받아 누가 이기는지만 정하는 '경매'.
-                  점수를 소비만 하고 계산은 안 한다. 선택 정책은 성격이 정함.
+  입력: AffectRequest  (Arbiter 가 만든 정제 숫자 — valence·salience·prev_affect…)
+  출력: AffectOutput   (E·A·intensity·expression_intent + route/path/tags/moment_id)
+
+Affect 는 게임 룰도(어떤 이벤트가 +/-인지), 분기 정책도(언제 채팅할지) 모른다.
+valence·salience 라는 숫자만 받아 기분(E·A)으로 적분하고, route·path·tags·moment_id 는
+**변형 없이 통과(passthrough)**시킨다. prev_affect 를 동봉받아 무상태로 유지된다
+— 같은 요청이면 같은 출력.
+
+  affect(req, prev_state, cfg) -> (new_state, output, expr)
 """
 from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import math
 
 from config import PersonalityConfig
+from expression import express, expression_intent
 
 
 # ---------------------------------------------------------------------------
-# 상태 & 후보
+# 지속 상태 (세션이 들고 다니는 누적치) & 한 턴 출력
 # ---------------------------------------------------------------------------
 @dataclass
 class AffectState:
@@ -29,90 +33,20 @@ class AffectState:
 
 
 @dataclass
-class Candidate:
-    kind: str
-    intensity: float = 0.5     # 자극의 세기 (목표면 urgency로 해석)
-    is_goal: bool = False      # 목표 엔진이 만든 내부 목표인가
-    age: float = 0.0           # Backlog에서 묵은 턴 수 (0 = 이번 턴 새 자극)
-    payload: dict = field(default_factory=dict)
+class AffectOutput:
+    """노션 ② AffectState 출력. Arbiter 로 돌아가지 않고 앞으로만 흐른다."""
+    E: float
+    A: float
+    intensity: float
+    expression_intent: dict          # 표현층 직행 (표정·이펙트·톤). 항상.
+    route: dict                      # 입력값 그대로 통과 (Affect 는 안 건드림)
+    path: str
+    tags: list[str] = field(default_factory=list)
+    moment_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
-# Appraisal — 자극 -> (valence, intensity) 결정론 룩업
-# ---------------------------------------------------------------------------
-APPRAISAL_TABLE: dict[str, tuple[float, float]] = {
-    "greeting":          ( 0.30, 0.20),
-    "smalltalk":         ( 0.05, 0.30),
-    "game_positive":     ( 0.60, 0.85),
-    "game_negative":     (-0.55, 0.80),
-    "user_distress":     (-0.15, 0.55),
-    "compliment":        ( 0.50, 0.50),
-    "insult":            (-0.60, 0.70),
-    "goal_follow_nudge": ( 0.10, 0.30),
-}
-
-SOCIAL_KINDS = {"greeting", "smalltalk", "compliment", "user_distress", "goal_follow_nudge"}
-
-
-def appraise(c: Candidate, cfg: PersonalityConfig) -> tuple[float, float]:
-    valence, base_int = APPRAISAL_TABLE.get(c.kind, (0.0, 0.3))
-    strength = base_int * c.intensity
-    dE = valence * strength * cfg.reactivity
-    dA = strength * cfg.arousal_gain
-    return dE, dA
-
-
-# ---------------------------------------------------------------------------
-# salience — 후보 1개 -> 점수 1개 (되먹임 포함)
-# ---------------------------------------------------------------------------
-def affect_mod(kind: str, state: AffectState) -> float:
-    """현재 감정 상태가 '무엇에 끌리는가'를 변조한다 = Arbiter 쪽 되먹임 통로."""
-    m = 1.0
-    # 열기가 낮으면 사교적 자극에 덜 끌림 (0.4 ~ 1.0)
-    if kind in SOCIAL_KINDS:
-        m *= 0.4 + 0.6 * state.openness
-    # mood-congruent: 기분 좋을 땐 긍정 자극, 나쁠 땐 부정 자극에 더 끌림
-    if kind in ("game_positive", "compliment", "greeting"):
-        m *= 1.0 + 0.3 * max(0.0, state.E)
-    if kind in ("game_negative", "insult"):
-        m *= 1.0 + 0.3 * max(0.0, -state.E)
-    return m
-
-
-def salience(c: Candidate, state: AffectState, cfg: PersonalityConfig) -> float:
-    base = c.intensity                          # 목표/자극 공통 척도
-    weight = cfg.weight(c.kind)                 # 성격 주목 가중치
-    recency = math.exp(-cfg.backlog_decay * c.age)  # 묵을수록 끌림 ↓
-    mood = affect_mod(c.kind, state)            # 현재 상태 되먹임
-    return base * weight * recency * mood
-
-
-# ---------------------------------------------------------------------------
-# Arbiter — 점수 받아 승자만 결정 (정책은 성격이 정함)
-# ---------------------------------------------------------------------------
-def arbitrate(
-    candidates: list[Candidate], state: AffectState, cfg: PersonalityConfig
-) -> tuple[list[Candidate], list[Candidate]]:
-    if not candidates:
-        return [], []
-    scored = sorted(
-        ((salience(c, state, cfg), c) for c in candidates),
-        key=lambda x: x[0], reverse=True,
-    )
-    pol = cfg.select_policy
-    if pol.type == "argmax":
-        winners = [scored[0][1]]
-    else:  # top_k: 임계 이상을 max_winners 까지 ("둘 다" 가능)
-        winners = [c for s, c in scored if s >= pol.threshold][: pol.max_winners]
-        if not winners:
-            winners = [scored[0][1]]            # 전부 임계 미만이면 최소 1개
-    win_ids = {id(c) for c in winners}
-    losers = [c for _, c in scored if id(c) not in win_ids]
-    return winners, losers
-
-
-# ---------------------------------------------------------------------------
-# Decay + 통합 = 한 턴
+# 감쇠 / 기저값 / 클램프
 # ---------------------------------------------------------------------------
 def _decay_toward(value, baseline, rate, dt):
     return baseline + (value - baseline) * math.exp(-rate * dt)
@@ -127,26 +61,50 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-def update(
-    state: AffectState,
-    candidates: list[Candidate],
-    cfg: PersonalityConfig,
-    dt: float = 1.0,
-) -> tuple[AffectState, list[Candidate], list[Candidate]]:
-    # (a) 감쇠 — 지난 기분이 시간만큼 기저로 식음
-    E = _decay_toward(state.E, cfg.valence_bias, cfg.decay_E, dt)
-    A = _decay_toward(state.A, 0.15, cfg.decay_A, dt)
-    openness = _decay_toward(state.openness, openness_baseline(state.intimacy), 0.3, dt)
-    work = replace(state, E=E, A=A, openness=openness)
+# ---------------------------------------------------------------------------
+# 적분 — valence·salience 숫자 한 쌍 -> 기분 변화
+# ---------------------------------------------------------------------------
+def _integrate(E, A, openness, valence, salience, cfg):
+    strength = salience                  # 주목도(importance×부스터)가 곧 자극 세기
+    dE = valence * strength * cfg.reactivity
+    dA = strength * cfg.arousal_gain
+    E = _clamp(E + dE, -1.0, 1.0)
+    A = _clamp(A + dA, 0.0, 1.0)
+    openness = _clamp(openness + max(0.0, dE) * cfg.warmup, 0.0, 1.0)
+    return E, A, openness
 
-    # (b) 주목 — 무엇에 반응할지 (salience -> Arbiter)
-    winners, losers = arbitrate(candidates, work, cfg)
 
-    # (c) 평가 + 통합 — 이긴 자극들로 기분 갱신
-    for w in winners:
-        dE, dA = appraise(w, cfg)
-        E = _clamp(E + dE, -1.0, 1.0)
-        A = _clamp(A + dA, 0.0, 1.0)
-        openness = _clamp(openness + max(0.0, dE) * cfg.warmup, 0.0, 1.0)
+# ---------------------------------------------------------------------------
+# affect — 한 턴 (순수 함수)
+# ---------------------------------------------------------------------------
+def affect(req, prev_state: AffectState, cfg: PersonalityConfig, dt: float = 1.0):
+    """AffectRequest -> (new_state, AffectOutput, Expression).
+    req 는 arbiter.AffectRequest 이지만 import 하지 않고 덕타이핑으로 읽는다(순환참조 회피)."""
+    # (a) 감쇠 — 동봉된 prev_affect 기준으로 기저로 식음 (무상태 유지)
+    base_E = req.state.prev_affect.get("E", prev_state.E)
+    base_A = req.state.prev_affect.get("A", prev_state.A)
+    E = _decay_toward(base_E, cfg.valence_bias, cfg.decay_E, dt)
+    A = _decay_toward(base_A, 0.15, cfg.decay_A, dt)
+    openness = _decay_toward(prev_state.openness, openness_baseline(req.state.intimacy), 0.3, dt)
 
-    return replace(state, E=E, A=A, openness=openness), winners, losers
+    # (b) 적분 — primary(+secondary) 의 valence·salience 로 기분 갱신
+    for stim in (req.primary, req.secondary):
+        if stim is None:
+            continue
+        E, A, openness = _integrate(E, A, openness, stim.valence, stim.salience, cfg)
+
+    # (c) 종합 세기 — A 와 |E| 의 혼합 (노션 예: 0.5·A + 0.5·|E|)
+    intensity = round(_clamp(0.5 * A + 0.5 * abs(E), 0.0, 1.0), 3)
+
+    new_state = replace(prev_state, E=E, A=A, openness=openness)
+    expr = express(new_state)
+
+    output = AffectOutput(
+        E=round(E, 3), A=round(A, 3), intensity=intensity,
+        expression_intent=expression_intent(expr, new_state),
+        route=req.route,                                  # 통과
+        path=req.path,                                    # 통과
+        tags=(list(req.primary.tags) if req.primary else []),
+        moment_id=(req.primary.moment_id if req.primary else None),
+    )
+    return new_state, output, expr

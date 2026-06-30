@@ -15,18 +15,14 @@ import json
 import math
 import os
 import sys
-from dataclasses import replace
 
 csv.field_size_limit(sys.maxsize)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from config import load_config
-from affect_engine import (
-    AffectState, Candidate, openness_baseline,
-    salience, affect_mod, appraise, arbitrate, _decay_toward, _clamp,
-    APPRAISAL_TABLE,
-)
+from affect_engine import AffectState, affect, openness_baseline, _decay_toward
+from arbiter import Candidate, build_request, select_score, affect_mod, map_event
 from expression import express
 from engine import speech_primary
 import chat
@@ -51,60 +47,10 @@ _KEYWORDS = [
 ]
 
 
-# ---- 실시간 델타: CSV 게임 이벤트 → 자극 매핑 -------------------------------
-# 관점 팀(PERSPECTIVE_TEAM)을 '우리/팔로우 팀'으로 본다. Riot 이벤트를
-# game_positive/game_negative + 강도로 환산해 패널 자극으로 연결한다.
-PERSPECTIVE_TEAM = 100
+# ---- 실시간 델타: CSV 게임 이벤트 로딩 (변환 로직은 arbiter.map_event) -------
+# Riot 이벤트 → 자극 변환은 Arbiter 책임(arbiter.map_event). 여기선 CSV 를 읽어
+# 패널 드롭다운에 채우는 plumbing 만 한다.
 CSV_PATH = os.path.join(os.path.dirname(__file__), "raw_frame_202606281750.csv")
-_MAJOR_MONSTER = {"baron": (1.0, "바론"), "dragon": (0.9, "드래곤"),
-                  "elderDragon": (1.0, "장로 드래곤"), "riftHerald": (0.85, "전령"),
-                  "voidGrub": (0.55, "공허충"), "horde": (0.55, "공허충")}
-_TURRET_TIER = {"outer": 0.6, "inner": 0.7, "base": 0.85, "nexus": 1.0}
-
-
-def _pteam(pid):
-    return 100 if isinstance(pid, int) and 1 <= pid <= 5 else 200
-
-
-def map_event(p: dict, team: int = PERSPECTIVE_TEAM):
-    """게임 이벤트 payload → (kind, intensity, 설명) 또는 None(델타 아님).
-    건물/포탑 teamID 는 '잃은(소유) 팀'으로 가정한다.
-    team=0(팔로우 없음) → 중립 시청: 큰 플레이를 가벼운 흥분(positive·강도↓)으로."""
-    if team == 0:
-        base = map_event(p, 100)
-        if base is None:
-            return None
-        _, inten, desc = base
-        return "game_positive", round(inten * 0.7, 2), desc
-    s = p.get("rfc461Schema")
-
-    def kind(is_pos):
-        return "game_positive" if is_pos else "game_negative"
-
-    if s == "epic_monster_kill":
-        mt = p.get("monsterType")
-        if mt not in _MAJOR_MONSTER:
-            return None              # 정글 잡몹(raptor 등)은 델타로 안 침
-        inten, nm = _MAJOR_MONSTER[mt]
-        return kind(p.get("killerTeamID") == team), inten, f"{nm} 처치"
-    if s == "champion_kill":
-        b = p.get("bounty") or 0
-        return kind(p.get("killerTeamID") == team), min(0.95, 0.65 + (0.1 if b >= 300 else 0)), "챔피언 킬"
-    if s == "champion_kill_special":
-        kt = p.get("killType", "")
-        return kind(_pteam(p.get("killer")) == team), 0.85 if kt == "firstBlood" else 0.8, kt or "특수 킬"
-    if s == "building_destroyed":
-        bt, tier = p.get("buildingType"), p.get("turretTier")
-        inten = 0.8 if bt == "inhibitor" else _TURRET_TIER.get(tier, 0.7)
-        nm = f"{tier} 타워" if bt == "turret" else (bt or "건물")
-        return kind(p.get("teamID") != team), inten, f"{nm} 파괴"
-    if s == "turret_plate_destroyed":
-        return kind(p.get("teamID") != team), 0.45, "포탑 방패"
-    if s == "game_end":
-        win = p.get("winningTeam") == team
-        return kind(win), 1.0, "게임 종료(승)" if win else "게임 종료(패)"
-    return None
-
 
 # 원시 이벤트는 팀 무관하게 저장하고, 관점(team)별 매핑은 요청 때 한다.
 _EVT_KEYS = ("rfc461Schema", "monsterType", "killerTeamID", "victimTeamID", "teamID",
@@ -165,52 +111,84 @@ def _payload_for(kind: str, text: str) -> dict:
 # 대사는 LLM/문장 뱅크를 쓰지 않는다. affect engine 출력값을 JSON 으로 그대로 내보낸다.
 
 
-# ---- 어펙트 엔진 한 턴 트레이스 ---------------------------------------------
-def trace_turn(state: AffectState, pool: list, cfg, dt: float = 1.0):
-    """-> (arbiter_log, affect_log, result_state, winners)"""
-    E = _decay_toward(state.E, cfg.valence_bias, cfg.decay_E, dt)
-    A = _decay_toward(state.A, 0.15, cfg.decay_A, dt)
-    op = _decay_toward(state.openness, openness_baseline(state.intimacy), 0.3, dt)
-    work = replace(state, E=E, A=A, openness=op)
+# ---- Arbiter → Affect 한 턴 트레이스 ----------------------------------------
+def _stim_dict(st):
+    if st is None:
+        return None
+    return {"moment_id": st.moment_id, "type": st.type, "valence": st.valence,
+            "salience": st.salience, "source": st.source, "tags": st.tags}
 
-    arb = ["※ decay 직후 상태 기준으로 끌림을 계산한다.", "",
-           "salience  (base × weight × recency × mood = score)"]
+
+def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
+               user_spoke: bool, dt: float = 1.0):
+    """-> (arbiter_log, affect_log, req, output, new_state, winners)"""
+    prev = {"E": state.E, "A": state.A, "openness": state.openness}
+
+    # ── ① Arbiter: 선택(prev_affect 되먹임) + AffectRequest 조립 ──────────
+    arb = ["Arbiter — Riot 흡수 + 선택 (직전 감정 prev_affect 로 되먹임)", "",
+           "select_score  (intensity × weight × recency × mood)"]
     if not pool:
         arb.append("   (후보 없음 — 소스층 입력이 비었음)")
     score_by_id = {}
     for c in pool:
-        base, weight = c.intensity, cfg.weight(c.kind)
         recency = math.exp(-cfg.backlog_decay * c.age)
-        mood = affect_mod(c.kind, work)
-        score = salience(c, work, cfg)
-        score_by_id[id(c)] = score
-        arb.append(f"   {c.kind:<18} {base:.2f} × {weight:.2f} × {recency:.2f} × {mood:.2f} = {score:.3f}")
-    winners, losers = arbitrate(pool, work, cfg)
+        mood = affect_mod(c.kind, prev)
+        sc = select_score(c, prev, cfg)
+        score_by_id[id(c)] = sc
+        arb.append(f"   {c.kind:<18} {c.intensity:.2f} × {cfg.weight(c.kind):.2f} × "
+                   f"{recency:.2f} × {mood:.2f} = {sc:.3f}")
+
+    req, winners, losers = build_request(
+        char_id=cfg.name, turn_id=turn_id, tick=tick, candidates=pool,
+        intimacy=state.intimacy, prev_affect={"E": state.E, "A": state.A},
+        prev_openness=state.openness, cfg=cfg, user_spoke=user_spoke)
+
     pol = cfg.select_policy
-    arb += ["", f"arbiter  (policy={pol.type}, thr={pol.threshold}, max={pol.max_winners})"]
+    arb += ["", f"select  (policy={pol.type}, thr={pol.threshold}, max={pol.max_winners})"]
     for c in winners:
         arb.append(f"   WIN   {c.kind:<18} ({score_by_id[id(c)]:.3f})")
     for c in losers:
         tag = "thr 미만" if score_by_id[id(c)] < pol.threshold else "순위 밀림"
-        arb.append(f"   lose  {c.kind:<18} ({score_by_id[id(c)]:.3f})  {tag}")
+        arb.append(f"   defer {c.kind:<18} ({score_by_id[id(c)]:.3f})  {tag}")
 
-    aff = ["decay (지난 기분이 기저로 식음)",
-           f"   E {state.E:+.2f}→{E:+.2f}   A {state.A:.2f}→{A:.2f}   "
-           f"열기 {state.openness:.2f}→{op:.2f}   (기저열기={openness_baseline(state.intimacy):.2f})",
-           "", "appraise + integrate (이긴 자극 → 기분 갱신)"]
-    E2, A2, op2 = E, A, op
-    for w in winners:
-        dE, dA = appraise(w, cfg)
-        val = APPRAISAL_TABLE.get(w.kind, (0.0, 0.3))[0]
-        E2 = _clamp(E2 + dE, -1.0, 1.0)
-        A2 = _clamp(A2 + dA, 0.0, 1.0)
-        op2 = _clamp(op2 + max(0.0, dE) * cfg.warmup, 0.0, 1.0)
-        aff.append(f"   {w.kind:<18} valence {val:+.2f} → dE {dE:+.3f}, dA {dA:+.3f}")
-    if not winners:
+    arb += ["", "→ AffectRequest (Affect 엔 숫자만 넘긴다)"]
+
+    def stim_line(tag, st):
+        if st is None:
+            arb.append(f"   {tag}: (없음)")
+        else:
+            arb.append(f"   {tag}: type={st.type:<6} valence={st.valence:+.2f} "
+                       f"salience={st.salience:.3f} src={st.source} tags={st.tags}")
+    stim_line("primary  ", req.primary)
+    stim_line("secondary", req.secondary)
+    arb.append(f"   path={req.path}   route={req.route}")
+    arb.append(f"   deferred_ids={req.deferred_ids}")
+    arb.append(f"   state: intimacy={req.state.intimacy:.2f}  match_heat={req.state.match_heat:.2f}  "
+               f"prev_affect={req.state.prev_affect}")
+
+    # ── ② Affect: 숫자로 기분 계산 (순수 함수) ──────────────────────────
+    new_state, output, _expr = affect(req, state, cfg, dt)
+    base_E = req.state.prev_affect["E"]
+    base_A = req.state.prev_affect["A"]
+    E0 = _decay_toward(base_E, cfg.valence_bias, cfg.decay_E, dt)
+    A0 = _decay_toward(base_A, 0.15, cfg.decay_A, dt)
+    op0 = _decay_toward(state.openness, openness_baseline(state.intimacy), 0.3, dt)
+    aff = ["decay (prev_affect 가 기저로 식음)",
+           f"   E {base_E:+.2f}→{E0:+.2f}   A {base_A:.2f}→{A0:.2f}   "
+           f"열기 {state.openness:.2f}→{op0:.2f}   (기저열기={openness_baseline(state.intimacy):.2f})",
+           "", "integrate (valence × salience × 기질 → 기분 갱신)"]
+    for st in (req.primary, req.secondary):
+        if st is None:
+            continue
+        dE = st.valence * st.salience * cfg.reactivity
+        dA = st.salience * cfg.arousal_gain
+        aff.append(f"   {st.type:<8} valence {st.valence:+.2f} × salience {st.salience:.3f} "
+                   f"→ dE {dE:+.3f}, dA {dA:+.3f}")
+    if req.primary is None:
         aff.append("   (반응할 자극 없음)")
-    aff.append(f"   결과 상태   E {E:+.2f}→{E2:+.2f}   A {A:.2f}→{A2:.2f}   열기 {op:.2f}→{op2:.2f}")
-    result = {"E": round(E2, 3), "A": round(A2, 3), "openness": round(op2, 3)}
-    return "\n".join(arb), "\n".join(aff), result, winners
+    aff.append(f"   결과   E {output.E:+.2f}   A {output.A:.2f}   "
+               f"intensity {output.intensity:.2f}   열기 {new_state.openness:.2f}")
+    return "\n".join(arb), "\n".join(aff), req, output, new_state, winners
 
 
 def compute(q: dict) -> dict:
@@ -256,45 +234,59 @@ def compute(q: dict) -> dict:
     A = fv("A", 0.15) if has("A") else 0.15
 
     state = AffectState(E=E, A=A, openness=openness, intimacy=intimacy)
-    expr = express(state)
+    expr = express(state)              # 입력 상태의 표현 (상단 표시용)
 
-    # ── 후보 풀 (소스층 → 어펙트 입력) ────────────────────────────────────
+    # ── 후보 풀 (소스층 → Arbiter 입력) ───────────────────────────────────
     pool = []
     primary_kind = None
+    user_spoke = text is not None
     if text is not None:
         primary_kind = classify_kind(text) if auto else q.get("kind", ["smalltalk"])[0]
-        pool.append(Candidate(primary_kind, 0.7, payload=_payload_for(primary_kind, text)))
+        pool.append(Candidate(primary_kind, 0.7, source="user",
+                              payload=_payload_for(primary_kind, text)))
     if game:
-        pool.append(Candidate(game, gint, payload=_payload_for(game, "")))
+        pool.append(Candidate(game, gint, source="delta", payload=_payload_for(game, "")))
     # 목표 엔진: 신규(친밀도<0.5) + 팔로잉 없음 → 팔로우 유도
     goal_fired = False
     if intimacy < 0.5 and not following:
-        pool.append(Candidate("goal_follow_nudge", 0.5, is_goal=True))
+        pool.append(Candidate("goal_follow_nudge", 0.5, source="goal", is_goal=True))
         goal_fired = True
 
     # 대화기록(반복) → skip_gate 변주 트리거용 history
     history = [{"kind": primary_kind, "route": "T1", "text": ""} for _ in range(repeat)] \
         if primary_kind else []
 
-    arbiter_log, affect_log, trace_result, winners = trace_turn(state, pool, CFG)
+    turn_id = "t_pg"
+    tick = int(fv("tick", 0))
+    arbiter_log, affect_log, req, output, next_state, winners = \
+        trace_turn(state, pool, CFG, turn_id, tick, user_spoke)
+    trace_result = {"E": output.E, "A": output.A, "openness": round(next_state.openness, 3)}
 
     # ── 대사 = affect engine 출력 (JSON, LLM 0) ───────────────────────────
     # 자유 발화 우선: winner 중 자유 발화가 있으면 그것이 발화 대상 (engine.speech_primary)
     primary = speech_primary(winners)
-    # skip_gate 는 결정론 분기 판정만 한다 (LLM 호출 X). 대화기록(반복)이 여기에 작용.
-    route = chat.skip_gate(primary, history) if primary else "—"
     priority = bool(winners and primary is not winners[0])  # 자유발화 우선이 살리언스 1등을 덮었나
+    # skip_gate(T1/LLM)는 route.chat==true 일 때만 의미. LLM 실제 호출은 안 함.
+    skip = (chat.skip_gate(primary, history) if (output.route.get("chat") and primary) else "—")
     affect_output = {
-        "winners": [w.kind for w in winners],
-        "speech_primary": primary.kind if primary else None,
-        "freeform_priority": priority,
-        "skip_gate": route,            # T1=템플릿 / LLM=캐스케이드 (실제 호출은 안 함)
-        "affect_state": {"E": round(state.E, 3), "A": round(state.A, 3),
-                         "openness": round(state.openness, 3),
-                         "intimacy": round(state.intimacy, 3)},
-        "expression": {"face": expr.face, "energy": expr.energy, "tone": expr.tone,
-                       "effect_color": expr.effect_color, "particles": expr.particles},
-        "next_state": trace_result,    # appraise 후 상태
+        "request": {                   # ① AffectRequest (Arbiter → Affect)
+            "char_id": req.char_id, "turn_id": req.turn_id, "seed": req.seed, "tick": req.tick,
+            "primary": _stim_dict(req.primary), "secondary": _stim_dict(req.secondary),
+            "path": req.path, "route": req.route, "deferred_ids": req.deferred_ids,
+            "state": {"intimacy": req.state.intimacy, "match_heat": req.state.match_heat,
+                      "prev_affect": req.state.prev_affect},
+        },
+        "output": {                    # ② AffectOutput (Affect → 표현/채팅)
+            "E": output.E, "A": output.A, "intensity": output.intensity,
+            "expression_intent": output.expression_intent,
+            "route": output.route, "path": output.path,
+            "tags": output.tags, "moment_id": output.moment_id,
+        },
+        "speech": {                    # 발화 분기 (route.chat 이후 단계)
+            "speech_primary": primary.kind if primary else None,
+            "freeform_priority": priority,
+            "skip_gate": skip,         # T1=템플릿 / LLM=캐스케이드
+        },
     }
 
     # ── 소스층 요약 로그 ──────────────────────────────────────────────────
