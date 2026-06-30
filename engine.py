@@ -36,6 +36,15 @@ def goal_engine(session: Session) -> list[Candidate]:
 BACKLOG_DROP = 0.05   # salience 가 이 밑이면 폐기되는 임계(나이로 감쇠시켜 처리)
 
 
+def speech_primary(winners):
+    """발화 대상 선택. 자유 발화(유저가 직접 건 대화)를 실시간 델타·정형 자극보다
+    우선한다 — 살리언스 1등이 게임 알림이라도, 유저 발화엔 먼저 답한다."""
+    for w in winners:
+        if w.kind in chat.FREEFORM_KINDS:
+            return w
+    return winners[0] if winners else None
+
+
 def turn(session, stimuli, cfg, dt=1.0):
     # 2) 후보 풀: 새 자극 + Backlog + 목표
     candidates = list(stimuli) + session.backlog + goal_engine(session)
@@ -52,9 +61,9 @@ def turn(session, stimuli, cfg, dt=1.0):
             refreshed.append(aged)
     session.backlog = refreshed
 
-    # 5) 표현 + 채팅 (주목한 것 중 첫 번째를 발화 대상으로)
+    # 5) 표현 + 채팅 (자유 발화 우선 → 없으면 살리언스 1등)
     expr = express(session.state)
-    primary = winners[0]
+    primary = speech_primary(winners)
     text, route = chat.respond(primary, session.state, expr, cfg, session.history)
 
     # 6) 피드백 루프 — 결과를 친밀도/팔로잉으로 되먹임

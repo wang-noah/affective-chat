@@ -24,6 +24,7 @@ from affect_engine import (
     APPRAISAL_TABLE,
 )
 from expression import express
+from engine import speech_primary
 import chat
 
 CFG = load_config(os.path.join(os.path.dirname(__file__), "character.json"))
@@ -176,11 +177,15 @@ def compute(q: dict) -> dict:
     arbiter_log, affect_log, trace_result, winners = trace_turn(state, pool, CFG)
 
     # ── 대사 = affect engine 출력 (JSON, LLM 0) ───────────────────────────
-    primary = winners[0] if winners else None
+    # 자유 발화 우선: winner 중 자유 발화가 있으면 그것이 발화 대상 (engine.speech_primary)
+    primary = speech_primary(winners)
     # skip_gate 는 결정론 분기 판정만 한다 (LLM 호출 X). 대화기록(반복)이 여기에 작용.
     route = chat.skip_gate(primary, history) if primary else "—"
+    priority = bool(winners and primary is not winners[0])  # 자유발화 우선이 살리언스 1등을 덮었나
     affect_output = {
         "winners": [w.kind for w in winners],
+        "speech_primary": primary.kind if primary else None,
+        "freeform_priority": priority,
         "skip_gate": route,            # T1=템플릿 / LLM=캐스케이드 (실제 호출은 안 함)
         "affect_state": {"E": round(state.E, 3), "A": round(state.A, 3),
                          "openness": round(state.openness, 3),
