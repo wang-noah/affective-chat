@@ -68,7 +68,14 @@ def _pteam(pid):
 
 def map_event(p: dict, team: int = PERSPECTIVE_TEAM):
     """게임 이벤트 payload → (kind, intensity, 설명) 또는 None(델타 아님).
-    건물/포탑 teamID 는 '잃은(소유) 팀'으로 가정한다."""
+    건물/포탑 teamID 는 '잃은(소유) 팀'으로 가정한다.
+    team=0(팔로우 없음) → 중립 시청: 큰 플레이를 가벼운 흥분(positive·강도↓)으로."""
+    if team == 0:
+        base = map_event(p, 100)
+        if base is None:
+            return None
+        _, inten, desc = base
+        return "game_positive", round(inten * 0.7, 2), desc
     s = p.get("rfc461Schema")
 
     def kind(is_pos):
@@ -99,7 +106,13 @@ def map_event(p: dict, team: int = PERSPECTIVE_TEAM):
     return None
 
 
-def load_events(path: str = CSV_PATH, team: int = PERSPECTIVE_TEAM, cap: int = 400):
+# 원시 이벤트는 팀 무관하게 저장하고, 관점(team)별 매핑은 요청 때 한다.
+_EVT_KEYS = ("rfc461Schema", "monsterType", "killerTeamID", "victimTeamID", "teamID",
+             "winningTeam", "killer", "bounty", "buildingType", "turretTier",
+             "gameTime", "sequenceIndex")
+
+
+def load_events_raw(path: str = CSV_PATH, cap: int = 400):
     out = []
     if not os.path.exists(path):
         return out
@@ -109,20 +122,23 @@ def load_events(path: str = CSV_PATH, team: int = PERSPECTIVE_TEAM, cap: int = 4
                 p = json.loads(row["payload"])
             except Exception:
                 continue
-            m = map_event(p, team)
-            if not m:
+            if map_event(p, 100) is None:    # notable 여부는 팀과 무관
                 continue
-            k, inten, desc = m
-            gt = (p.get("gameTime") or 0) / 1000.0
-            sign = "＋" if k == "game_positive" else "－"
-            out.append({"seq": p.get("sequenceIndex"), "gt": gt, "kind": k,
-                        "intensity": round(inten, 2),
-                        "label": f"{int(gt // 60):02d}:{int(gt % 60):02d} {desc} {sign}"})
-    out.sort(key=lambda e: e["gt"])
+            out.append({k: p.get(k) for k in _EVT_KEYS})
+    out.sort(key=lambda d: (d.get("gameTime") or 0))
     return out[:cap]
 
 
-EVENTS = load_events()
+EVENTS_RAW = load_events_raw()
+
+
+def event_view(d: dict, team: int) -> dict:
+    """원시 이벤트 + 관점 팀 → {label, kind, intensity}."""
+    k, inten, desc = map_event(d, team)
+    gt = (d.get("gameTime") or 0) / 1000.0
+    sign = "○" if team == 0 else ("＋" if k == "game_positive" else "－")
+    return {"label": f"{int(gt // 60):02d}:{int(gt % 60):02d} {desc} {sign}",
+            "kind": k, "intensity": inten}
 
 
 def classify_kind(text: str) -> str:
@@ -221,11 +237,12 @@ def compute(q: dict) -> dict:
     # 온톨로지 토픽
     onto = q["onto"][0] if has("onto") else ""
     # 실시간 델타 (게임 이벤트): CSV 실데이터 우선, 없으면 합성 드롭다운
+    team = int(fv("team", 100))     # 관점 팀: 100 / 200 / 0(팔로우 없음)
     evt_idx = q["evt"][0] if has("evt") and q["evt"][0] not in ("", "-1") else None
     delta_label = None
-    if evt_idx is not None and EVENTS and 0 <= int(evt_idx) < len(EVENTS):
-        ev = EVENTS[int(evt_idx)]
-        game, gint, delta_label = ev["kind"], ev["intensity"], "CSV " + ev["label"]
+    if evt_idx is not None and EVENTS_RAW and 0 <= int(evt_idx) < len(EVENTS_RAW):
+        v = event_view(EVENTS_RAW[int(evt_idx)], team)
+        game, gint, delta_label = v["kind"], v["intensity"], "CSV " + v["label"]
     else:
         game = q["game"][0] if has("game") and q["game"][0] not in ("", "(없음)") else None
         gint = fv("gint", 0.7)
@@ -375,10 +392,16 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
     <input type=text id=onto value="롤 e스포츠"></div>
 
   <div class=src><div class=top><input type=checkbox class=use id=use_game checked><label>실시간 델타 (게임)</label><span class=v id=gintv></span></div>
+    <div class=sub2>관점 팀
+      <select id=team style="width:auto;display:inline-block;margin:0 0 0 6px;padding:3px 6px">
+        <option value=100>팀100 (우리)</option>
+        <option value=200>팀200</option>
+        <option value=0>팔로우 없음(중립)</option>
+      </select></div>
     <select id=evt></select>
     <select id=game></select>
     <input type=range id=gint min=0 max=1 step=.05 value=.9>
-    <div class=sub2 id=evtnote>CSV 이벤트 선택 시 합성/강도 무시 · 관점=팀100</div></div>
+    <div class=sub2 id=evtnote>CSV 이벤트 선택 시 합성/강도 무시</div></div>
 
   <div class=src><div class=top><input type=checkbox class=use id=use_following checked><label>팔로잉</label></div>
     <div class=sub2><input type=checkbox id=following><label for=following style="font-weight:400">팀 팔로우함</label></div></div>
@@ -421,12 +444,19 @@ const KINDS = __KINDS__;
 const $=id=>document.getElementById(id);
 KINDS.forEach(k=>{const o=document.createElement('option');o.value=o.textContent=k;if(k==='user_distress')o.selected=true;$('kind').appendChild(o)});
 ['(없음)','game_positive','game_negative'].forEach(k=>{const o=document.createElement('option');o.value=o.textContent=k;$('game').appendChild(o)});
-// CSV 실시간 델타 이벤트 채우기
-fetch('/api/events').then(r=>r.json()).then(list=>{
-  const e=$('evt');const o0=document.createElement('option');o0.value='-1';o0.textContent='(합성 사용)';e.appendChild(o0);
-  list.forEach((ev,i)=>{const o=document.createElement('option');o.value=i;o.textContent=ev.label+' ['+ev.kind.replace('game_','')+' '+ev.intensity+']';e.appendChild(o)});
-  $('evtnote').textContent='CSV 이벤트 '+list.length+'개 로드됨 · 선택 시 합성/강도 무시 · 관점=팀100';
-});
+// CSV 실시간 델타 이벤트 채우기 (관점 팀에 따라 +/− 라벨이 바뀜)
+function loadEvents(){
+  const e=$('evt'); const prev=e.value;
+  fetch('/api/events?team='+$('team').value).then(r=>r.json()).then(list=>{
+    e.innerHTML='';
+    const o0=document.createElement('option');o0.value='-1';o0.textContent='(합성 사용)';e.appendChild(o0);
+    list.forEach((ev,i)=>{const o=document.createElement('option');o.value=i;o.textContent=ev.label+' ['+ev.kind.replace('game_','')+' '+ev.intensity+']';e.appendChild(o)});
+    e.value=prev && prev!=='' ? prev : '-1';   // 선택 인덱스 유지
+    $('evtnote').textContent='CSV 이벤트 '+list.length+'개 · 선택 시 합성/강도 무시';
+  });
+}
+$('team').addEventListener('change',()=>{loadEvents();dirty();});
+loadEvents();
 
 const COLOR={warm:'#f0883e',cool:'#58a6ff'};
 let lastResult=null;
@@ -465,7 +495,7 @@ function run(){
   if($('use_fan').checked)P.set('fan',$('fan').value);
   if($('use_intimacy').checked)P.set('intimacy',$('intimacy').value);
   if($('use_onto').checked)P.set('onto',$('onto').value);
-  if($('use_game').checked){P.set('game',$('game').value);P.set('gint',$('gint').value);P.set('evt',$('evt').value);}
+  if($('use_game').checked){P.set('game',$('game').value);P.set('gint',$('gint').value);P.set('evt',$('evt').value);P.set('team',$('team').value);}
   if($('use_following').checked)P.set('following',$('following').checked?'1':'0');
   if($('use_openness').checked)P.set('openness',$('openness').value);
   if($('use_E').checked)P.set('E',$('E').value);
@@ -502,7 +532,10 @@ class Handler(BaseHTTPRequestHandler):
             html = HTML.replace("__KINDS__", json.dumps(KINDS, ensure_ascii=False))
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
         elif parsed.path == "/api/events":
-            self._send(200, json.dumps(EVENTS, ensure_ascii=False).encode("utf-8"),
+            qs = parse_qs(parsed.query)
+            team = int(qs.get("team", ["100"])[0] or 100)
+            data = [event_view(d, team) for d in EVENTS_RAW]
+            self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
         elif parsed.path == "/api/compute":
             data = compute(parse_qs(parsed.query))
@@ -516,7 +549,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8765"))
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"▶ 소스층 컨트롤 패널: http://localhost:{port}  (Ctrl+C 종료)")
-    print(f"  캐릭터: {CFG.name} ({CFG.archetype}) · 실시간 델타 이벤트 {len(EVENTS)}개 로드")
+    print(f"  캐릭터: {CFG.name} ({CFG.archetype}) · 실시간 델타 이벤트 {len(EVENTS_RAW)}개 로드")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
