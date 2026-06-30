@@ -140,11 +140,33 @@ _TONE_FALLBACK = {"distant": "...그렇구나.", "neutral": "음, 그래.",
 
 
 def _demo_llm(winner, state, expr, cfg) -> str:
+    """친밀도 단계로 base 를 고르고, 표현층(E/A/열기)으로 변조한다.
+    -> 모든 소스층 슬라이더가 대사에 반영된다. (실제 텍스트 생성은 라이브 LLM 의 몫)"""
     stage, _ = chat._intimacy_stage(state.intimacy)
     bank = DEMO_LINES.get(winner.kind)
-    if bank and stage in bank:
-        return bank[stage]
-    return _TONE_FALLBACK.get(expr.tone, "음, 그래.")
+    line = bank[stage] if bank and stage in bank else _TONE_FALLBACK.get(expr.tone, "음, 그래.")
+
+    # E(정서) 낮으면 가라앉은 어조 (단, 흥분 상태가 아닐 때만)
+    if state.E <= -0.25 and expr.energy != "excited":
+        line = "하… " + line
+    # A(세기) → 말끝 에너지
+    if expr.energy == "excited":
+        if line.endswith("?"):
+            line = line[:-1] + "?!"
+        elif line.endswith("!"):
+            line = line.rstrip("!") + "!!"
+        else:
+            line = line.rstrip("….") + "!!"
+    elif expr.energy == "calm":
+        line = line.replace("?!", "?").replace("!!", "!")
+        if line.endswith("!"):
+            line = line.rstrip("!") + "."
+    # 열기(톤) → 거리감/따뜻함
+    if expr.tone == "warm" and not line.endswith(("~", "ㅋ", "ㅎ")):
+        line += " ㅎㅎ"
+    elif expr.tone == "distant":
+        line = line.replace(" ㅎㅎ", "").replace("~", "")
+    return line
 
 
 def compute(q: dict) -> dict:
