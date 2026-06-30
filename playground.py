@@ -10,10 +10,14 @@ playground.py — 소스층 컨트롤 패널 (입력 분리 + 결정론 대사)
   python3 playground.py        # -> http://localhost:8765
 """
 from __future__ import annotations
+import csv
 import json
 import math
 import os
+import sys
 from dataclasses import replace
+
+csv.field_size_limit(sys.maxsize)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -45,6 +49,80 @@ _KEYWORDS = [
     ("greeting",         ["안녕", "하이", "ㅎㅇ", "안뇽", "왔어", "또 왔", "잘 가", "잘가",
                           "바이", "ㅂㅂ", "반가", "오랜만"]),
 ]
+
+
+# ---- 실시간 델타: CSV 게임 이벤트 → 자극 매핑 -------------------------------
+# 관점 팀(PERSPECTIVE_TEAM)을 '우리/팔로우 팀'으로 본다. Riot 이벤트를
+# game_positive/game_negative + 강도로 환산해 패널 자극으로 연결한다.
+PERSPECTIVE_TEAM = 100
+CSV_PATH = os.path.join(os.path.dirname(__file__), "raw_frame_202606281750.csv")
+_MAJOR_MONSTER = {"baron": (1.0, "바론"), "dragon": (0.9, "드래곤"),
+                  "elderDragon": (1.0, "장로 드래곤"), "riftHerald": (0.85, "전령"),
+                  "voidGrub": (0.55, "공허충"), "horde": (0.55, "공허충")}
+_TURRET_TIER = {"outer": 0.6, "inner": 0.7, "base": 0.85, "nexus": 1.0}
+
+
+def _pteam(pid):
+    return 100 if isinstance(pid, int) and 1 <= pid <= 5 else 200
+
+
+def map_event(p: dict, team: int = PERSPECTIVE_TEAM):
+    """게임 이벤트 payload → (kind, intensity, 설명) 또는 None(델타 아님).
+    건물/포탑 teamID 는 '잃은(소유) 팀'으로 가정한다."""
+    s = p.get("rfc461Schema")
+
+    def kind(is_pos):
+        return "game_positive" if is_pos else "game_negative"
+
+    if s == "epic_monster_kill":
+        mt = p.get("monsterType")
+        if mt not in _MAJOR_MONSTER:
+            return None              # 정글 잡몹(raptor 등)은 델타로 안 침
+        inten, nm = _MAJOR_MONSTER[mt]
+        return kind(p.get("killerTeamID") == team), inten, f"{nm} 처치"
+    if s == "champion_kill":
+        b = p.get("bounty") or 0
+        return kind(p.get("killerTeamID") == team), min(0.95, 0.65 + (0.1 if b >= 300 else 0)), "챔피언 킬"
+    if s == "champion_kill_special":
+        kt = p.get("killType", "")
+        return kind(_pteam(p.get("killer")) == team), 0.85 if kt == "firstBlood" else 0.8, kt or "특수 킬"
+    if s == "building_destroyed":
+        bt, tier = p.get("buildingType"), p.get("turretTier")
+        inten = 0.8 if bt == "inhibitor" else _TURRET_TIER.get(tier, 0.7)
+        nm = f"{tier} 타워" if bt == "turret" else (bt or "건물")
+        return kind(p.get("teamID") != team), inten, f"{nm} 파괴"
+    if s == "turret_plate_destroyed":
+        return kind(p.get("teamID") != team), 0.45, "포탑 방패"
+    if s == "game_end":
+        win = p.get("winningTeam") == team
+        return kind(win), 1.0, "게임 종료(승)" if win else "게임 종료(패)"
+    return None
+
+
+def load_events(path: str = CSV_PATH, team: int = PERSPECTIVE_TEAM, cap: int = 400):
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            try:
+                p = json.loads(row["payload"])
+            except Exception:
+                continue
+            m = map_event(p, team)
+            if not m:
+                continue
+            k, inten, desc = m
+            gt = (p.get("gameTime") or 0) / 1000.0
+            sign = "＋" if k == "game_positive" else "－"
+            out.append({"seq": p.get("sequenceIndex"), "gt": gt, "kind": k,
+                        "intensity": round(inten, 2),
+                        "label": f"{int(gt // 60):02d}:{int(gt % 60):02d} {desc} {sign}"})
+    out.sort(key=lambda e: e["gt"])
+    return out[:cap]
+
+
+EVENTS = load_events()
 
 
 def classify_kind(text: str) -> str:
@@ -142,9 +220,16 @@ def compute(q: dict) -> dict:
     intimacy = fv("intimacy", 0.0) if has("intimacy") else 0.0
     # 온톨로지 토픽
     onto = q["onto"][0] if has("onto") else ""
-    # 실시간 델타 (게임 이벤트)
-    game = q["game"][0] if has("game") and q["game"][0] not in ("", "(없음)") else None
-    gint = fv("gint", 0.7)
+    # 실시간 델타 (게임 이벤트): CSV 실데이터 우선, 없으면 합성 드롭다운
+    evt_idx = q["evt"][0] if has("evt") and q["evt"][0] not in ("", "-1") else None
+    delta_label = None
+    if evt_idx is not None and EVENTS and 0 <= int(evt_idx) < len(EVENTS):
+        ev = EVENTS[int(evt_idx)]
+        game, gint, delta_label = ev["kind"], ev["intensity"], "CSV " + ev["label"]
+    else:
+        game = q["game"][0] if has("game") and q["game"][0] not in ("", "(없음)") else None
+        gint = fv("gint", 0.7)
+        delta_label = f"합성 {game}" if game else None
     # 팔로잉
     following = ["T1"] if (has("following") and q["following"][0] == "1") else []
     # 열기
@@ -203,7 +288,7 @@ def compute(q: dict) -> dict:
     row(has("fan"), "유저 팬심", f"{int(fan)}점 → {fan_grade(fan)}" if has("fan") else "(미입력→0)")
     row(has("intimacy"), "친밀도", f"{intimacy:.1f}" if has("intimacy") else "(미입력→0)")
     row(has("onto"), "온톨로지", f'"{onto}" (표시용·미연결)' if has("onto") else "(미입력)")
-    row(game is not None, "실시간 델타", f"{game} (강도 {gint:.2f})" if game else "(미입력/없음)")
+    row(game is not None, "실시간 델타", f"{delta_label} → {game} (강도 {gint:.2f})" if game else "(미입력/없음)")
     row(has("following"), "팔로잉", ("팔로우함" if following else "팔로우 안 함") if has("following") else "(미입력→없음)")
     row(has("openness"), "열기/인텐스", f"{openness:.2f}" if has("openness") else "(미입력→0)")
     row(has("E"), "정서 E", f"{E:+.2f}" if has("E") else "(미입력→0)")
@@ -290,8 +375,10 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
     <input type=text id=onto value="롤 e스포츠"></div>
 
   <div class=src><div class=top><input type=checkbox class=use id=use_game checked><label>실시간 델타 (게임)</label><span class=v id=gintv></span></div>
+    <select id=evt></select>
     <select id=game></select>
-    <input type=range id=gint min=0 max=1 step=.05 value=.9></div>
+    <input type=range id=gint min=0 max=1 step=.05 value=.9>
+    <div class=sub2 id=evtnote>CSV 이벤트 선택 시 합성/강도 무시 · 관점=팀100</div></div>
 
   <div class=src><div class=top><input type=checkbox class=use id=use_following checked><label>팔로잉</label></div>
     <div class=sub2><input type=checkbox id=following><label for=following style="font-weight:400">팀 팔로우함</label></div></div>
@@ -334,6 +421,12 @@ const KINDS = __KINDS__;
 const $=id=>document.getElementById(id);
 KINDS.forEach(k=>{const o=document.createElement('option');o.value=o.textContent=k;if(k==='user_distress')o.selected=true;$('kind').appendChild(o)});
 ['(없음)','game_positive','game_negative'].forEach(k=>{const o=document.createElement('option');o.value=o.textContent=k;$('game').appendChild(o)});
+// CSV 실시간 델타 이벤트 채우기
+fetch('/api/events').then(r=>r.json()).then(list=>{
+  const e=$('evt');const o0=document.createElement('option');o0.value='-1';o0.textContent='(합성 사용)';e.appendChild(o0);
+  list.forEach((ev,i)=>{const o=document.createElement('option');o.value=i;o.textContent=ev.label+' ['+ev.kind.replace('game_','')+' '+ev.intensity+']';e.appendChild(o)});
+  $('evtnote').textContent='CSV 이벤트 '+list.length+'개 로드됨 · 선택 시 합성/강도 무시 · 관점=팀100';
+});
 
 const COLOR={warm:'#f0883e',cool:'#58a6ff'};
 let lastResult=null;
@@ -372,7 +465,7 @@ function run(){
   if($('use_fan').checked)P.set('fan',$('fan').value);
   if($('use_intimacy').checked)P.set('intimacy',$('intimacy').value);
   if($('use_onto').checked)P.set('onto',$('onto').value);
-  if($('use_game').checked){P.set('game',$('game').value);P.set('gint',$('gint').value);}
+  if($('use_game').checked){P.set('game',$('game').value);P.set('gint',$('gint').value);P.set('evt',$('evt').value);}
   if($('use_following').checked)P.set('following',$('following').checked?'1':'0');
   if($('use_openness').checked)P.set('openness',$('openness').value);
   if($('use_E').checked)P.set('E',$('E').value);
@@ -408,6 +501,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             html = HTML.replace("__KINDS__", json.dumps(KINDS, ensure_ascii=False))
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
+        elif parsed.path == "/api/events":
+            self._send(200, json.dumps(EVENTS, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
         elif parsed.path == "/api/compute":
             data = compute(parse_qs(parsed.query))
             self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"),
@@ -420,7 +516,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8765"))
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"▶ 소스층 컨트롤 패널: http://localhost:{port}  (Ctrl+C 종료)")
-    print(f"  캐릭터: {CFG.name} ({CFG.archetype})")
+    print(f"  캐릭터: {CFG.name} ({CFG.archetype}) · 실시간 델타 이벤트 {len(EVENTS)}개 로드")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
