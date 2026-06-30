@@ -67,57 +67,7 @@ def _payload_for(kind: str, text: str) -> dict:
     return {"text": text}
 
 
-# ---- 결정론 대사 생성 (LLM 0) -----------------------------------------------
-# winner kind 로 base 를 고르고, affect 출력값(E/A/열기/친밀도)으로 변조한다.
-DEMO_LINES = {
-    "user_distress": {"초면": "아 그래...? 무슨 일 있었는데.",
-                      "알아가는 중": "엥 뭔데, 무슨 일 있었어?",
-                      "친한 사이": "헐 왜, 무슨 일 있었어? 짜증 제대로 났나 보네.",
-                      "절친": "아우 또 뭔데~ 어떤 놈이 우리 열받게 한 거야, 다 말해봐."},
-    "smalltalk":     {"초면": "음, 그렇구나.",
-                      "알아가는 중": "오 그래? 좀 더 얘기해봐.",
-                      "친한 사이": "ㅋㅋ 뭐야 그게, 재밌네.",
-                      "절친": "야 그거 완전 너답다 ㅋㅋㅋ 더 풀어봐~"},
-    "compliment":    {"초면": "어... 고마워.",
-                      "알아가는 중": "헤, 그런 말 들으니까 좋네.",
-                      "친한 사이": "뭐야~ 갑자기 칭찬이야? 기분 좋다 ㅋㅋ",
-                      "절친": "아 진짜? 너밖에 없다 진짜~ 좋아 죽겠네 ㅋㅋ"},
-    "insult":        {"초면": "...뭐라는 거야.",
-                      "알아가는 중": "어이없네. 왜 그래 갑자기.",
-                      "친한 사이": "야 너 진짜 ㅋㅋ 선 넘지 말고.",
-                      "절친": "또 시작이네 ㅋㅋ 너니까 봐준다."},
-    "game_negative": {"초면": "아 졌네... 별로다.",
-                      "알아가는 중": "아 방금 그거 던졌어, 봤어?",
-                      "친한 사이": "아 미쳤다 진짜 왜 저기서 짤려 ㅠㅠ",
-                      "절친": "야야 봤어?? 한타 그거 개답답해 진짜 ㅋㅋㅋ"},
-}
-_TONE_FALLBACK = {"distant": "...그렇구나.", "neutral": "음, 그래.", "warm": "오~ 그래그래, 더 말해봐!"}
-
-
-def affect_to_line(winner, state, expr, cfg) -> str:
-    """affect engine 출력 → 대사 (결정론, LLM 0). 정형 kind 는 chat.respond 가
-    T1 템플릿으로 처리하므로 여기엔 자유 발화 kind 만 들어온다."""
-    stage, _ = chat._intimacy_stage(state.intimacy)
-    bank = DEMO_LINES.get(winner.kind)
-    line = bank[stage] if bank and stage in bank else _TONE_FALLBACK.get(expr.tone, "음, 그래.")
-    if state.E <= -0.25 and expr.energy != "excited":
-        line = "하… " + line
-    if expr.energy == "excited":
-        if line.endswith("?"):
-            line = line[:-1] + "?!"
-        elif line.endswith("!"):
-            line = line.rstrip("!") + "!!"
-        else:
-            line = line.rstrip("….") + "!!"
-    elif expr.energy == "calm":
-        line = line.replace("?!", "?").replace("!!", "!")
-        if line.endswith("!"):
-            line = line.rstrip("!") + "."
-    if expr.tone == "warm" and not line.endswith(("~", "ㅋ", "ㅎ")):
-        line += " ㅎㅎ"
-    elif expr.tone == "distant":
-        line = line.replace(" ㅎㅎ", "").replace("~", "")
-    return line
+# 대사는 LLM/문장 뱅크를 쓰지 않는다. affect engine 출력값을 JSON 으로 그대로 내보낸다.
 
 
 # ---- 어펙트 엔진 한 턴 트레이스 ---------------------------------------------
@@ -225,16 +175,20 @@ def compute(q: dict) -> dict:
 
     arbiter_log, affect_log, trace_result, winners = trace_turn(state, pool, CFG)
 
-    # ── 대사 (결정론, LLM 0) ──────────────────────────────────────────────
-    if winners:
-        primary = winners[0]
-        system, user_text = chat.build_context(primary, state, expr, CFG)
-        line, route = chat.respond(primary, state, expr, CFG, history, use_llm=affect_to_line)
-        route_label = "T1·템플릿" if route == "T1" else "규칙·affect"
-    else:
-        primary = None
-        system, user_text, line = "(발화/자극 없음)", "", "(자극 없음 — 채팅 경로 미진입)"
-        route_label = "—"
+    # ── 대사 = affect engine 출력 (JSON, LLM 0) ───────────────────────────
+    primary = winners[0] if winners else None
+    # skip_gate 는 결정론 분기 판정만 한다 (LLM 호출 X). 대화기록(반복)이 여기에 작용.
+    route = chat.skip_gate(primary, history) if primary else "—"
+    affect_output = {
+        "winners": [w.kind for w in winners],
+        "skip_gate": route,            # T1=템플릿 / LLM=캐스케이드 (실제 호출은 안 함)
+        "affect_state": {"E": round(state.E, 3), "A": round(state.A, 3),
+                         "openness": round(state.openness, 3),
+                         "intimacy": round(state.intimacy, 3)},
+        "expression": {"face": expr.face, "energy": expr.energy, "tone": expr.tone,
+                       "effect_color": expr.effect_color, "particles": expr.particles},
+        "next_state": trace_result,    # appraise 후 상태
+    }
 
     # ── 소스층 요약 로그 ──────────────────────────────────────────────────
     def row(on, label, val):
@@ -258,8 +212,7 @@ def compute(q: dict) -> dict:
         "effect_color": expr.effect_color, "particles": expr.particles,
         "stage": stage, "stage_dir": stage_dir,
         "baseline_openness": round(openness_baseline(intimacy), 3),
-        "system": system, "user": user_text,
-        "dialogue": line, "route": route_label,
+        "affect_output": affect_output,
         "kind_used": primary_kind or "", "auto": auto,
         "source_log": "\n".join(src),
         "trace_arbiter": arbiter_log, "trace_affect": affect_log,
@@ -301,6 +254,7 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin:0 0 9px}
   .card.arb h2{color:#58a6ff}.card.aff h2{color:#d2a8ff}.card.src h2{color:#3fb950}
   pre{margin:0;white-space:pre-wrap;font:12.5px/1.6 ui-monospace,Menlo,monospace;color:#adbac7}
+  pre.affjson{color:#7ee787}
   .user{color:#8b949e;font-size:13px;margin-bottom:6px}
   .dialogue{font-size:19px;font-weight:700;color:#7ee787}
   .mode{float:right;font-size:11px;color:#8b949e;font-weight:400;text-transform:none}
@@ -366,8 +320,8 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
     <div class="card aff"><h2>② Affect Engine <button id=applyTurn style="float:right;width:auto;margin:0;padding:3px 9px;font-size:11px">▶ 이 턴 적용</button></h2><pre id=aff></pre></div>
   </div>
 
-  <div class=card><h2>대사 (결정론 · affect engine 출력 기반, LLM 0) <span class=mode id=mode></span></h2>
-    <div class=user id=user></div><div class=dialogue id=dialogue></div></div>
+  <div class=card><h2>대사 = affect engine 출력 (JSON · LLM 0)</h2>
+    <pre id=affjson class=affjson></pre></div>
  </div>
 </div>
 <script>
@@ -401,9 +355,7 @@ function render(d){
   $('stage').innerHTML='친밀도 단계: '+d.stage+'<small>'+d.stage_dir+' · 친밀도 기저 열기 ≈ '+d.baseline_openness+'</small>';
   $('srclog').textContent=d.source_log;
   $('arb').textContent=d.trace_arbiter;$('aff').textContent=d.trace_affect;
-  $('user').textContent=d.user?('유저: '+d.user):'(발화 없음)';
-  $('dialogue').textContent='루나: '+d.dialogue;
-  $('mode').textContent='route='+d.route+(d.auto&&d.kind_used?(' · kind='+d.kind_used+'(자동)'):'');
+  $('affjson').textContent=JSON.stringify(d.affect_output,null,2);
   if(d.auto&&d.kind_used)$('kind').value=d.kind_used;
   lastResult=d.trace_result;
 }
