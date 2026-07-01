@@ -57,6 +57,16 @@ def openness_baseline(intimacy: float) -> float:
     return 1.0 / (1.0 + math.exp(-(intimacy - 5.0) / 2.0))
 
 
+def decay_state(state: "AffectState", cfg: PersonalityConfig, dt: float) -> "AffectState":
+    """자극 없이 시간 dt 만큼 기저로 식힘 — affect() step (a) 와 같은 식.
+    스왑 공백(캐릭터를 안 보던 동안) 재개 시 호출한다. 친밀도도 시간감소."""
+    E = _decay_toward(state.E, cfg.valence_bias, cfg.decay_E, dt)
+    A = _decay_toward(state.A, 0.15, cfg.decay_A, dt)
+    openness = _decay_toward(state.openness, openness_baseline(state.intimacy), 0.3, dt)
+    intimacy = state.intimacy * (cfg.intimacy_decay ** dt)
+    return replace(state, E=E, A=A, openness=openness, intimacy=intimacy)
+
+
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
