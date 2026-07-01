@@ -390,7 +390,7 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
     <input type=range id=fan min=0 max=10000 step=100 value=1500></div>
 
   <div class=src><div class=top><input type=checkbox class=use id=use_intimacy checked><label>친밀도</label><span class=v id=iv></span></div>
-    <input type=range id=intimacy min=0 max=10 step=.1 value=1></div>
+    <input type=range id=intimacy min=0 max=12 step=.1 value=1></div>
 
   <div class=src><div class=top><input type=checkbox class=use id=use_onto checked><label>온톨로지 토픽</label></div>
     <input type=text id=onto value="롤 e스포츠"></div>
