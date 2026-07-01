@@ -308,7 +308,8 @@ def build_request(
 #   팀(killerTeamID/teamID)을 풀어 valence 부호(game_positive/negative)로,
 #   이벤트종류·등급을 intensity 로 환산한다. (원본 필드는 여기서만 소비)
 # ===========================================================================
-PERSPECTIVE_TEAM = 100  # 관점 팀 = '우리/팔로우 팀'
+PERSPECTIVE_TEAM = 100  # 폴백 기본값. 실제 관점은 캐릭터가 소유(config.perspective_team →
+                        # Session.perspective_team)하고, 앱 층이 map_event(p, team)에 넘긴다.
 _MAJOR_MONSTER = {"baron": (1.0, "바론"), "dragon": (0.9, "드래곤"),
                   "elderDragon": (1.0, "장로 드래곤"), "riftHerald": (0.85, "전령"),
                   "voidGrub": (0.55, "공허충"), "horde": (0.55, "공허충")}
