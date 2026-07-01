@@ -1,21 +1,19 @@
 """
-arbiter.py — Riot 흡수 + 선택 (Affect 앞단)
-==========================================
-노션 'Arbiter → Affect 데이터 전달' 문서의 Arbiter 책임을 담는다.
+arbiter.py — Riot 흡수 + 선택 + 열기 계산 (Affect 앞단)
+======================================================
+소스층 자극을 받아 정제 숫자(AffectRequest)로 만들어 Affect(affect_engine)로 넘긴다.
 
-  Riot 라이브 ─> Arbiter ─(AffectRequest)─> Affect ─> 표현층
+  자극 풀 ─> [Arbiter] 선택·값매기기·열기 ─(AffectRequest)─> [Affect] E·A ─> 표현/채팅
 
-Arbiter 가 하는 일:
-  1) 변환  — Riot 원본 이벤트를 moment 로. 이벤트종류 → importance,
-             팀(killerTeamID/teamID) → valence, bounty·등급 → salience 부스터.
-  2) 선택  — salience 로 후보를 줄세워 승자(primary/secondary)를 고른다.
-             선택 정책(argmax / top_k)은 성격이 정한다.
-  3) 분기  — route.chat (말까지 할지)을 판단한다. Affect 는 이 값을 그대로 통과시킴.
-  4) 보류  — 진 자극은 deferred_ids 로 Backlog 회수.
-  5) 수집  — intimacy / match_heat / prev_affect 를 state 로 동봉.
+하는 일:
+  1) 변환    — Riot 원본 이벤트를 자극으로 (kind·intensity, 팀 → valence 부호).
+  2) 값매기기 — 자극종류 → valence, importance × 부스터 × 팬심 → salience.
+  3) 선택    — salience·성격가중치로 승자(primary/secondary)를 고른다.
+  4) 분기    — route.chat (말까지 할지)을 판단한다.
+  5) 열기    — 경기(data) 자극으로 열기(match heat)를 계산한다 = 게임 도메인 값.
 
-핵심: Affect 엔 **valence·salience·match_heat 같은 숫자만** 넘긴다.
-      원본 killerTeamID·bounty·payload 등은 여기서만 쓰고 넘기지 않는다.
+감정(E·A) 적분은 affect_engine 이 맡는다. 열기는 "경기가 얼마나 뜨거운가"라
+게임을 아는 Arbiter 가 계산해 넘긴다.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -56,8 +54,11 @@ class Stim:
 
 @dataclass
 class ReqState:
-    intimacy: float = 0.0           # 친밀도 (관계)
-    match_heat: float = 0.0         # 경기 열기 ← stats_update
+    intimacy: float = 0.0           # 친밀도 (유저↔캐릭터 관계)
+    match_heat: float = 0.0         # 이번 턴 경기 자극 세기(입력 신호, 참고용)
+    heat: float = 0.0               # Arbiter 가 계산한 새 열기(match heat) — Affect 가 상태로 실음
+    fan_tier: str = "rookie"        # 유저↔팔로우팀 Fan심 등급 (표시/로그용)
+    fan_factor: float = 1.0         # 팔로우팀(data) 자극 salience 배율
     prev_affect: dict = field(default_factory=lambda: {"E": 0.0, "A": 0.15})
 
 
@@ -147,15 +148,41 @@ def appraisal_salience(c: Candidate) -> float:
     return importance_of(c) * booster(c)
 
 
+# ===========================================================================
+# 팬심(Fan심) — 유저↔팔로우팀 관여 깊이 → 팔로우팀 자극 salience 증폭기
+#   노션 '팬심' 문서: 누적 Fan심(상승만)을 등급으로 변환하고, 등급이 개인화
+#   ("Companion 이 더 뜨겁게 반응")를 좌우한다. 여기선 P0 범위 = 누적 등급만
+#   반영한다(모멘텀/열기는 후속). valence 는 건드리지 않고 '팔로우팀 관련
+#   자극(data)'의 salience(주목도)만 키운다 → 광팬일수록 우리 팀 이벤트에 더
+#   크게 반응(좋을 땐 더 기쁘게, 나쁠 땐 더 속상하게). 선택 순위(select_score)
+#   에는 관여하지 않는다.
+# ===========================================================================
+FAN_TIERS = [(8000, "die_hard"), (4000, "core"), (1500, "devoted"), (500, "follower")]
+FAN_FACTOR = {"rookie": 1.0, "follower": 1.15, "devoted": 1.30, "core": 1.50, "die_hard": 1.80}
+
+
+def fan_tier(cumulative: float) -> str:
+    """누적 Fan심 → 등급 코드 (팬심 문서 7절 경계값 초안)."""
+    for thr, name in FAN_TIERS:
+        if cumulative >= thr:
+            return name
+    return "rookie"
+
+
+def fan_factor(cumulative: float) -> float:
+    """등급 → 팔로우팀(data) 자극 salience 배율 (rookie 1.0 → die_hard 1.8)."""
+    return FAN_FACTOR[fan_tier(cumulative)]
+
+
 def affect_mod(kind: str, prev: dict) -> float:
     """직전 감정(prev_affect)이 '무엇에 끌리는가'를 변조 = 되먹임 통로.
     Affect 안이 아니라 Arbiter 에서, 지난 턴 결과로 계산한다(턴 내 순환 없음)."""
     E = prev.get("E", 0.0)
-    op = prev.get("openness", 0.0)
+    warmth = prev.get("warmth", 0.0)        # 친밀도 기반 친밀감(0~1)
     m = 1.0
-    # 열기가 낮으면 사교적 자극에 덜 끌림 (0.4 ~ 1.0)
+    # 아직 서먹하면(친밀도 낮음) 사교적 자극에 덜 끌림 (0.4 ~ 1.0)
     if kind in SOCIAL_KINDS:
-        m *= 0.4 + 0.6 * op
+        m *= 0.4 + 0.6 * warmth
     # mood-congruent: 기분 좋을 땐 긍정 자극, 나쁠 땐 부정 자극에 더 끌림
     if kind in ("game_positive", "compliment", "greeting"):
         m *= 1.0 + 0.3 * max(0.0, E)
@@ -246,12 +273,15 @@ def match_heat_from(candidates: list[Candidate]) -> float:
     return round(min(1.0, sum(c.intensity for c in data) / len(data)), 3)
 
 
-def _to_stim(c: Candidate, cfg: PersonalityConfig) -> Stim:
+def _to_stim(c: Candidate, cfg: PersonalityConfig, fan_factor: float = 1.0) -> Stim:
+    sal = appraisal_salience(c)
+    if stim_type(c) == "data":          # 팔로우팀 경기 이벤트에만 팬심 배율 적용
+        sal *= fan_factor
     return Stim(
         moment_id=c.moment_id or f"m_{c.kind}",
         type=stim_type(c),
         valence=round(valence_of(c), 3),
-        salience=round(appraisal_salience(c), 4),
+        salience=round(sal, 4),
         source=c.source,
         tags=tags_for(c),
     )
@@ -268,21 +298,32 @@ def build_request(
     candidates: list[Candidate],
     intimacy: float,
     prev_affect: dict,          # {"E":, "A":}
-    prev_openness: float,
     cfg: PersonalityConfig,
     user_spoke: bool,
     match_heat: float | None = None,
+    fan: float = 0.0,               # 누적 Fan심 (유저↔팔로우팀)
+    fan_target: bool = True,        # 팔로우팀이 있는가 (없으면 팬심 배율 무효)
+    prev_heat: float = 0.0,         # 직전 열기 (감쇠 기준)
+    dt: float = 1.0,                # 열기 감쇠용 시간 간격
     seed: int | None = None,
 ) -> tuple[AffectRequest, list[Candidate], list[Candidate]]:
     """후보 풀 → (AffectRequest, winners, losers).
-    winners/losers 는 오케스트레이터(engine)가 표현·발화·Backlog 에 쓰도록 함께 반환."""
+    winners/losers 는 오케스트레이터(engine)가 표현·발화에 쓰도록 함께 반환."""
     prev = {"E": prev_affect.get("E", 0.0),
             "A": prev_affect.get("A", 0.15),
-            "openness": prev_openness}
+            "warmth": min(1.0, max(0.0, intimacy / 6.0))}  # 친밀도→친밀감(절친 6≈1.0)
     winners, losers = select(candidates, prev, cfg)
 
-    primary = _to_stim(winners[0], cfg) if winners else None
-    secondary = _to_stim(winners[1], cfg) if len(winners) > 1 else None
+    tier = fan_tier(fan)
+    ffac = fan_factor(fan) if fan_target else 1.0   # 팔로우팀 없으면 증폭 안 함
+    primary = _to_stim(winners[0], cfg, ffac) if winners else None
+    secondary = _to_stim(winners[1], cfg, ffac) if len(winners) > 1 else None
+
+    # 열기(match heat) 계산 — Arbiter 책임. 감쇠 후 팔로우팀 경기(data) 자극으로 가열.
+    heat = prev_heat * math.exp(-cfg.decay_heat * dt)   # 조용하면 0 으로 식음
+    for st in (primary, secondary):
+        if st is not None and st.type == "data":
+            heat = min(1.0, heat + st.salience * cfg.heat_gain)
 
     req = AffectRequest(
         char_id=char_id,
@@ -297,6 +338,9 @@ def build_request(
         state=ReqState(
             intimacy=round(intimacy, 3),
             match_heat=match_heat if match_heat is not None else match_heat_from(candidates),
+            heat=round(heat, 4),
+            fan_tier=tier,
+            fan_factor=round(ffac, 3),
             prev_affect={"E": round(prev["E"], 3), "A": round(prev["A"], 3)},
         ),
     )

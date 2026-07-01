@@ -21,8 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from config import load_config
-from affect_engine import AffectState, affect, openness_baseline, _decay_toward
-from arbiter import Candidate, build_request, select_score, affect_mod, map_event
+from affect_engine import AffectState, affect, _decay_toward
+from arbiter import Candidate, build_request, select_score, affect_mod, map_event, fan_tier
 from expression import express
 from engine import speech_primary
 import chat
@@ -95,11 +95,14 @@ def classify_kind(text: str) -> str:
     return "smalltalk"
 
 
+# 팬심 문서 7절 등급 → 한글 표시명 (누적 점수 기준, 강등 없음)
+_FAN_TIER_KO = {"rookie": "입문 팬", "follower": "동행 팬", "devoted": "열혈 팬",
+                "core": "코어 팬", "die_hard": "광팬"}
+
+
 def fan_grade(score: float) -> str:
-    for thr, name in [(800, "다이아"), (500, "플래티넘"), (200, "골드"), (50, "실버")]:
-        if score >= thr:
-            return name
-    return "브론즈"
+    """누적 Fan심 → 등급 표시명 (arbiter.fan_tier 와 동일 경계값)."""
+    return _FAN_TIER_KO[fan_tier(score)]
 
 
 def _payload_for(kind: str, text: str) -> dict:
@@ -120,9 +123,9 @@ def _stim_dict(st):
 
 
 def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
-               user_spoke: bool, dt: float = 1.0):
+               user_spoke: bool, dt: float = 1.0, fan: float = 0.0, fan_target: bool = True):
     """-> (arbiter_log, affect_log, req, output, new_state, winners)"""
-    prev = {"E": state.E, "A": state.A, "openness": state.openness}
+    prev = {"E": state.E, "A": state.A, "warmth": min(1.0, max(0.0, state.intimacy / 6.0))}
 
     # ── ① Arbiter: 선택(prev_affect 되먹임) + AffectRequest 조립 ──────────
     arb = ["Arbiter — Riot 흡수 + 선택 (직전 감정 prev_affect 로 되먹임)", "",
@@ -141,7 +144,8 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     req, winners, losers = build_request(
         char_id=cfg.name, turn_id=turn_id, tick=tick, candidates=pool,
         intimacy=state.intimacy, prev_affect={"E": state.E, "A": state.A},
-        prev_openness=state.openness, cfg=cfg, user_spoke=user_spoke)
+        fan=fan, fan_target=fan_target, prev_heat=state.heat, dt=dt,
+        cfg=cfg, user_spoke=user_spoke)
 
     pol = cfg.select_policy
     arb += ["", f"select  (policy={pol.type}, thr={pol.threshold}, max={pol.max_winners})"]
@@ -152,6 +156,8 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
         arb.append(f"   defer {c.kind:<18} ({score_by_id[id(c)]:.3f})  {tag}")
 
     arb += ["", "→ AffectRequest (Affect 엔 숫자만 넘긴다)"]
+    if req.state.fan_factor != 1.0:
+        arb.append(f"   팬심 {req.state.fan_tier} → 팔로우팀(data) 자극 salience ×{req.state.fan_factor:.2f}")
 
     def stim_line(tag, st):
         if st is None:
@@ -164,19 +170,19 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     arb.append(f"   path={req.path}   route={req.route}")
     arb.append(f"   deferred_ids={req.deferred_ids}")
     arb.append(f"   state: intimacy={req.state.intimacy:.2f}  match_heat={req.state.match_heat:.2f}  "
-               f"prev_affect={req.state.prev_affect}")
+               f"팬심={req.state.fan_tier}(×{req.state.fan_factor:.2f})  prev_affect={req.state.prev_affect}")
+    arb.append(f"   열기(Arbiter 계산): {state.heat:.2f} → {req.state.heat:.2f}  "
+               f"(감쇠 후 경기 data 자극으로 가열)")
 
-    # ── ② Affect: 숫자로 기분 계산 (순수 함수) ──────────────────────────
+    # ── ② Affect: valence·salience 로 E·A 만 적분 (열기는 Arbiter 가 준 값 통과) ──
     new_state, output, _expr = affect(req, state, cfg, dt)
     base_E = req.state.prev_affect["E"]
     base_A = req.state.prev_affect["A"]
     E0 = _decay_toward(base_E, cfg.valence_bias, cfg.decay_E, dt)
     A0 = _decay_toward(base_A, 0.15, cfg.decay_A, dt)
-    op0 = _decay_toward(state.openness, openness_baseline(state.intimacy), 0.3, dt)
     aff = ["decay (prev_affect 가 기저로 식음)",
-           f"   E {base_E:+.2f}→{E0:+.2f}   A {base_A:.2f}→{A0:.2f}   "
-           f"열기 {state.openness:.2f}→{op0:.2f}   (기저열기={openness_baseline(state.intimacy):.2f})",
-           "", "integrate (valence·salience 는 Arbiter 가 준 값 → 곱해서 기분 갱신)"]
+           f"   E {base_E:+.2f}→{E0:+.2f}   A {base_A:.2f}→{A0:.2f}",
+           "", "integrate (valence·salience 는 Arbiter 가 준 값 → 곱해서 E·A 갱신)"]
     for st in (req.primary, req.secondary):
         if st is None:
             continue
@@ -187,7 +193,7 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     if req.primary is None:
         aff.append("   (반응할 자극 없음)")
     aff.append(f"   결과   E {output.E:+.2f}   A {output.A:.2f}   "
-               f"intensity {output.intensity:.2f}   열기 {new_state.openness:.2f}")
+               f"intensity {output.intensity:.2f}   열기 {new_state.heat:.2f}(Arbiter)")
     return "\n".join(arb), "\n".join(aff), req, output, new_state, winners
 
 
@@ -227,13 +233,13 @@ def compute(q: dict) -> dict:
         delta_label = f"합성 {game}" if game else None
     # 팔로잉
     following = ["T1"] if (has("following") and q["following"][0] == "1") else []
-    # 열기
-    openness = fv("openness", 0.0) if has("openness") else 0.0
+    # 열기 (match heat, 경기 열기 시작값)
+    heat = fv("heat", 0.0) if has("heat") else 0.0
     # 어펙트 상태값
     E = fv("E", 0.0) if has("E") else 0.0
     A = fv("A", 0.15) if has("A") else 0.15
 
-    state = AffectState(E=E, A=A, openness=openness, intimacy=intimacy)
+    state = AffectState(E=E, A=A, heat=heat, intimacy=intimacy)
     expr = express(state)              # 입력 상태의 표현 (상단 표시용)
 
     # ── 후보 풀 (소스층 → Arbiter 입력) ───────────────────────────────────
@@ -256,11 +262,13 @@ def compute(q: dict) -> dict:
     history = [{"kind": primary_kind, "route": "T1", "text": ""} for _ in range(repeat)] \
         if primary_kind else []
 
+    # 팬심: 팔로우팀(관점 팀 ≠ 0)이 있을 때만 팔로우팀 자극 salience 증폭
+    fan_target = has("fan") and team != 0
     turn_id = "t_pg"
     tick = int(fv("tick", 0))
     arbiter_log, affect_log, req, output, next_state, winners = \
-        trace_turn(state, pool, CFG, turn_id, tick, user_spoke)
-    trace_result = {"E": output.E, "A": output.A, "openness": round(next_state.openness, 3)}
+        trace_turn(state, pool, CFG, turn_id, tick, user_spoke, fan=fan, fan_target=fan_target)
+    trace_result = {"E": output.E, "A": output.A, "heat": round(next_state.heat, 3)}
 
     # ── 대사 = affect engine 출력 (JSON, LLM 0) ───────────────────────────
     # 자유 발화 우선: winner 중 자유 발화가 있으면 그것이 발화 대상 (engine.speech_primary)
@@ -274,6 +282,8 @@ def compute(q: dict) -> dict:
             "primary": _stim_dict(req.primary), "secondary": _stim_dict(req.secondary),
             "path": req.path, "route": req.route, "deferred_ids": req.deferred_ids,
             "state": {"intimacy": req.state.intimacy, "match_heat": req.state.match_heat,
+                      "heat": req.state.heat,
+                      "fan_tier": req.state.fan_tier, "fan_factor": req.state.fan_factor,
                       "prev_affect": req.state.prev_affect},
         },
         "output": {                    # ② AffectOutput (Affect → 표현/채팅)
@@ -294,12 +304,15 @@ def compute(q: dict) -> dict:
         src.append(f"{'☑' if on else '☐'} {label:<14} {val}")
     row(text is not None, "유저 발화", f'"{text}" → kind={primary_kind}' if text is not None else "(미입력)")
     row(has("repeat"), "대화 기록", f"같은 발화 {repeat}회 반복" if has("repeat") else "(미입력→0)")
-    row(has("fan"), "유저 팬심", f"{int(fan)}점 → {fan_grade(fan)}" if has("fan") else "(미입력→0)")
+    fan_note = (f"{int(fan)}점 → {fan_grade(fan)}"
+                + (f" · 팔로우팀 자극 ×{req.state.fan_factor:.2f}" if fan_target
+                   else " · 팔로우팀 없음→미적용")) if has("fan") else "(미입력→0)"
+    row(has("fan"), "유저 팬심", fan_note)
     row(has("intimacy"), "친밀도", f"{intimacy:.1f}" if has("intimacy") else "(미입력→0)")
     row(has("onto"), "온톨로지", f'"{onto}" (표시용·미연결)' if has("onto") else "(미입력)")
     row(game is not None, "실시간 델타", f"{delta_label} → {game} (강도 {gint:.2f})" if game else "(미입력/없음)")
     row(has("following"), "팔로잉", ("팔로우함" if following else "팔로우 안 함") if has("following") else "(미입력→없음)")
-    row(has("openness"), "열기/인텐스", f"{openness:.2f}" if has("openness") else "(미입력→0)")
+    row(has("heat"), "열기(경기)", f"{heat:.2f}" if has("heat") else "(미입력→0)")
     row(has("E"), "정서 E", f"{E:+.2f}" if has("E") else "(미입력→0)")
     row(has("A"), "세기 A", f"{A:.2f}" if has("A") else "(미입력→0.15)")
     if goal_fired:
@@ -310,7 +323,6 @@ def compute(q: dict) -> dict:
         "face": expr.face, "energy": expr.energy, "tone": expr.tone,
         "effect_color": expr.effect_color, "particles": expr.particles,
         "stage": stage, "stage_dir": stage_dir,
-        "baseline_openness": round(openness_baseline(intimacy), 3),
         "affect_output": affect_output,
         "kind_used": primary_kind or "", "auto": auto,
         "source_log": "\n".join(src),
@@ -374,11 +386,11 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   <div class=src><div class=top><input type=checkbox class=use id=use_repeat checked><label>대화 기록 (반복)</label><span class=v id=repeatv></span></div>
     <input type=range id=repeat min=0 max=5 step=1 value=0></div>
 
-  <div class=src><div class=top><input type=checkbox class=use id=use_fan checked><label>유저 팬심</label><span class=v id=fanv></span></div>
-    <input type=range id=fan min=0 max=1000 step=10 value=100></div>
+  <div class=src><div class=top><input type=checkbox class=use id=use_fan checked><label>유저 팬심 (누적)</label><span class=v id=fanv></span></div>
+    <input type=range id=fan min=0 max=10000 step=100 value=1500></div>
 
   <div class=src><div class=top><input type=checkbox class=use id=use_intimacy checked><label>친밀도</label><span class=v id=iv></span></div>
-    <input type=range id=intimacy min=0 max=10 step=.1 value=1></div>
+    <input type=range id=intimacy min=0 max=12 step=.1 value=1></div>
 
   <div class=src><div class=top><input type=checkbox class=use id=use_onto checked><label>온톨로지 토픽</label></div>
     <input type=text id=onto value="롤 e스포츠"></div>
@@ -398,9 +410,8 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   <div class=src><div class=top><input type=checkbox class=use id=use_following checked><label>팔로잉</label></div>
     <div class=sub2><input type=checkbox id=following><label for=following style="font-weight:400">팀 팔로우함</label></div></div>
 
-  <div class=src><div class=top><input type=checkbox class=use id=use_openness checked><label>열기 / 인텐스</label><span class=v id=ov></span></div>
-    <input type=range id=openness min=0 max=1 step=.05 value=.3>
-    <button id=autoOpen style="font-size:11px">↳ 친밀도 기저값으로 자동설정</button></div>
+  <div class=src><div class=top><input type=checkbox class=use id=use_heat checked><label>열기 (경기 heat)</label><span class=v id=heatv></span></div>
+    <input type=range id=heat min=0 max=1 step=.05 value=0></div>
 
   <div class=grp>어펙트 상태값 (E·A)</div>
   <div class=src><div class=top><input type=checkbox class=use id=use_E checked><label>정서 E</label><span class=v id=Ev></span></div>
@@ -458,7 +469,7 @@ function dirty(){setHint('● 입력 변경됨 — SEND 를 누르세요');}
 function syncLabels(){
   $('Ev').textContent=(+$('E').value).toFixed(2);
   $('Av').textContent=(+$('A').value).toFixed(2);
-  $('ov').textContent=(+$('openness').value).toFixed(2);
+  $('heatv').textContent=(+$('heat').value).toFixed(2);
   $('iv').textContent=(+$('intimacy').value).toFixed(1);
   $('repeatv').textContent=$('repeat').value+'회';
   $('fanv').textContent=$('fan').value+'점';
@@ -472,7 +483,7 @@ function render(d){
   $('b_color').textContent='이펙트 · '+d.effect_color;
   $('b_color').style.borderColor=COLOR[d.effect_color];
   $('dots').textContent='●'.repeat(d.particles);$('dots').style.color=COLOR[d.effect_color];
-  $('stage').innerHTML='친밀도 단계: '+d.stage+'<small>'+d.stage_dir+' · 친밀도 기저 열기 ≈ '+d.baseline_openness+'</small>';
+  $('stage').innerHTML='친밀도 단계: '+d.stage+'<small>'+d.stage_dir+'</small>';
   $('srclog').textContent=d.source_log;
   $('arb').textContent=d.trace_arbiter;$('aff').textContent=d.trace_affect;
   $('affjson').textContent=JSON.stringify(d.affect_output,null,2);
@@ -489,7 +500,7 @@ function run(){
   if($('use_onto').checked)P.set('onto',$('onto').value);
   if($('use_game').checked){P.set('game',$('game').value);P.set('gint',$('gint').value);P.set('evt',$('evt').value);P.set('team',$('team').value);}
   if($('use_following').checked)P.set('following',$('following').checked?'1':'0');
-  if($('use_openness').checked)P.set('openness',$('openness').value);
+  if($('use_heat').checked)P.set('heat',$('heat').value);
   if($('use_E').checked)P.set('E',$('E').value);
   if($('use_A').checked)P.set('A',$('A').value);
   fetch('/api/compute?'+P).then(r=>r.json()).then(d=>{render(d);setHint('');});
@@ -498,10 +509,9 @@ function run(){
 document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',()=>{syncLabels();dirty();}));
 $('text').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();run();}});
 $('send').addEventListener('click',run);
-$('autoOpen').addEventListener('click',()=>{const i=+$('intimacy').value,b=1/(1+Math.exp(-(i-5)/2));$('openness').value=b.toFixed(2);syncLabels();dirty();});
 $('applyTurn').addEventListener('click',()=>{if(!lastResult)return;
-  $('use_E').checked=$('use_A').checked=$('use_openness').checked=true;
-  $('E').value=lastResult.E;$('A').value=lastResult.A;$('openness').value=lastResult.openness;
+  $('use_E').checked=$('use_A').checked=$('use_heat').checked=true;
+  $('E').value=lastResult.E;$('A').value=lastResult.A;$('heat').value=lastResult.heat;
   syncLabels();setHint('● 결과 상태 적용됨 — SEND 로 다음 턴');});
 syncLabels();run();
 </script></html>"""

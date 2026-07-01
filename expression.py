@@ -1,9 +1,9 @@
 """
-expression.py — 3숫자 -> 프리셋 (결정론, LLM 0)
-E(정서) -> 표정,  A(세기) -> 에너지/파티클,  열기 -> 거리감/길이.
-"수치면 이 프리셋"이라는 매핑 표만으로 처리. 3D 대신 라벨/이모지로 스텁.
+expression.py — 수치 -> 프리셋 (결정론, LLM 0)
+E(정서) -> 표정,  A(세기) -> 에너지,  열기(match heat) -> 이펙트/파티클,
+친밀도 -> 말투 톤(거리감). "수치면 이 프리셋" 매핑 표만으로 처리. 3D 대신 라벨/이모지 스텁.
 
-state 는 E/A/openness 속성을 가진 어떤 객체든 받는다(덕타이핑) — affect_engine 을
+state 는 E/A/heat/intimacy 속성을 가진 어떤 객체든 받는다(덕타이핑) — arbiter 를
 import 하지 않아 순환참조를 피한다.
 """
 from __future__ import annotations
@@ -28,7 +28,7 @@ def express(state) -> Expression:
     else:
         face = "😒"
 
-    # A -> 에너지 (말 속도 / 느낌표 / 파티클)
+    # A -> 에너지 (말 속도 / 느낌표)
     if state.A > 0.66:
         energy = "excited"
     elif state.A > 0.33:
@@ -36,20 +36,21 @@ def express(state) -> Expression:
     else:
         energy = "calm"
 
-    # 열기 -> 톤 (짧고 거리감 ~ 따뜻)
-    if state.openness < 0.25:
+    # 친밀도 -> 톤 (짧고 거리감 ~ 따뜻). 관계가 깊을수록 warm.
+    if state.intimacy < 1.0:
         tone = "distant"
-    elif state.openness < 0.60:
+    elif state.intimacy < 3.0:
         tone = "neutral"
     else:
         tone = "warm"
 
+    # 열기(match heat) + A -> 파티클 수. 경기가 뜨거울수록 이펙트가 커진다.
     return Expression(
         face=face,
         energy=energy,
         tone=tone,
         effect_color="warm" if state.E >= 0 else "cool",
-        particles=int(round(state.A * 5)),
+        particles=int(round(max(state.A, state.heat) * 5)),
     )
 
 
@@ -75,4 +76,6 @@ def expression_intent(expr: Expression, state) -> dict:
         "energy": expr.energy,
         "effect_color": expr.effect_color,
         "particles": expr.particles,
+        "heat": round(state.heat, 3),       # 경기 열기 (🔥 게이지/연출용)
+        "hot": state.heat > 0.66,           # 열기 임계 도달 (🔥 배지)
     }

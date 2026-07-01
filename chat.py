@@ -67,14 +67,17 @@ def _fill_template(winner: Candidate, expr: Expression, history: list[dict]) -> 
 # 숫자만 던지면 모델이 잘 안 따르므로, 각 수치를 관계/기분/태도 directive 로 푼다.
 
 def _intimacy_stage(intimacy: float) -> tuple[str, str]:
-    """친밀도 누적치 -> 관계 단계 + 말투 지시. 대화감을 지배하는 핵심 변수."""
+    """친밀도 누적치 -> 관계 단계(L0~L4) + 말투 지시. (친밀도 문서 3절 단계 모델)
+    임계값은 초안 — 운영 데이터로 튜닝."""
     if intimacy < 1.0:
-        return "초면", "아직 서먹하다. 거리를 두고, 사적인 건 깊이 안 묻는다."
+        return "L0 첫 만남", "정중하게 소개하듯. 존댓말, 중립 호칭. 사적인 건 깊이 안 묻는다."
     if intimacy < 3.0:
-        return "알아가는 중", "조금씩 마음을 연다. 가벼운 반말, 관심은 보이되 과하지 않게."
+        return "L1 익숙", "밝고 친절하게. 가벼운 반말 섞고 이름을 부른다. 최근 사실 1~2개까지 언급."
     if intimacy < 6.0:
-        return "친한 사이", "편한 반말에 장난도 친다. 상대 일에 적극 공감한다."
-    return "절친", "아주 가깝다. 거침없는 반말과 애칭, 깊이 챙기고 공감한다."
+        return "L2 친근", "편안하고 장난기 있게. 반말 위주, 애칭도 가능. 좋아한 팀/플레이를 회상."
+    if intimacy < 10.0:
+        return "L3 신뢰·단골", "속깊게 응원하듯. 개인화 호칭, 과거 모멘트를 인용한다."
+    return "L4 단짝", "깊은 유대와 내적 농담. 둘만의 말투, 장기 기억을 적극 활용한다."
 
 
 def _mood_word(E: float) -> str:
@@ -93,7 +96,7 @@ def build_context(winner, state, expr, cfg) -> tuple[str, str]:
         f"[관계] 친밀도 {state.intimacy:.1f} → '{stage}'. {stage_dir}",
         f"[기분] 정서 E={state.E:+.2f} → {_mood_word(state.E)}. "
         f"세기 A={state.A:.2f} → 에너지는 '{expr.energy}'.",
-        f"[태도] 열기 {state.openness:.2f} → 말투 톤은 '{expr.tone}'. 표정 {expr.face}.",
+        f"[태도] 말투 톤은 '{expr.tone}'(친밀도 기반). 경기 열기 {state.heat:.2f}. 표정 {expr.face}.",
         "위 수치가 곧 너의 현재 상태다. 수치에 충실하게 한국어로 1~2문장만 말해라.",
     ])
     user_text = winner.payload.get("text", winner.kind)
