@@ -176,13 +176,13 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     aff = ["decay (prev_affect 가 기저로 식음)",
            f"   E {base_E:+.2f}→{E0:+.2f}   A {base_A:.2f}→{A0:.2f}   "
            f"열기 {state.openness:.2f}→{op0:.2f}   (기저열기={openness_baseline(state.intimacy):.2f})",
-           "", "integrate (valence × salience × 기질 → 기분 갱신)"]
+           "", "integrate (valence·salience 는 Arbiter 가 준 값 → 곱해서 기분 갱신)"]
     for st in (req.primary, req.secondary):
         if st is None:
             continue
         dE = st.valence * st.salience * cfg.reactivity
         dA = st.salience * cfg.arousal_gain
-        aff.append(f"   {st.type:<8} valence {st.valence:+.2f} × salience {st.salience:.3f} "
+        aff.append(f"   {st.type:<8} valence {st.valence:+.2f}(arbiter) × salience {st.salience:.3f}(arbiter) "
                    f"→ dE {dE:+.3f}, dA {dA:+.3f}")
     if req.primary is None:
         aff.append("   (반응할 자극 없음)")
