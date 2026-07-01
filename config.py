@@ -19,6 +19,7 @@ class SelectPolicy:
 class PersonalityConfig:
     name: str
     archetype: str = ""
+    perspective_team: int = 100     # 이 캐릭터가 응원하는 팀 (100/200, 0=중립 시청)
     attention: dict[str, float] = field(default_factory=dict)
     # 기질 파라미터 (Affect)
     reactivity: float = 1.0
@@ -45,6 +46,7 @@ def load_config(path: str) -> PersonalityConfig:
     return PersonalityConfig(
         name=raw["name"],
         archetype=raw.get("archetype", ""),
+        perspective_team=raw.get("perspective_team", 100),
         attention=raw.get("attention", {}),
         reactivity=t.get("reactivity", 1.0),
         valence_bias=t.get("valence_bias", 0.0),

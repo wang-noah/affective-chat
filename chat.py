@@ -12,7 +12,8 @@ from __future__ import annotations
 import os
 
 from config import PersonalityConfig
-from arbiter import Candidate, AffectState
+from affect_engine import AffectState
+from arbiter import Candidate
 from expression import Expression
 
 # 자유 발화 = 템플릿으로 못 막는 진짜 대화 -> LLM

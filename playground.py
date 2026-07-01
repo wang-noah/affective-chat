@@ -21,8 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from config import load_config
-from arbiter import (Candidate, build_request, select_score, affect_mod, map_event,
-                     fan_tier, AffectState, affect, _decay_toward)
+from affect_engine import AffectState, affect, _decay_toward
+from arbiter import Candidate, build_request, select_score, affect_mod, map_event, fan_tier
 from expression import express
 from engine import speech_primary
 import chat
@@ -144,7 +144,7 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     req, winners, losers = build_request(
         char_id=cfg.name, turn_id=turn_id, tick=tick, candidates=pool,
         intimacy=state.intimacy, prev_affect={"E": state.E, "A": state.A},
-        fan=fan, fan_target=fan_target,
+        fan=fan, fan_target=fan_target, prev_heat=state.heat, dt=dt,
         cfg=cfg, user_spoke=user_spoke)
 
     pol = cfg.select_policy
@@ -171,30 +171,29 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     arb.append(f"   deferred_ids={req.deferred_ids}")
     arb.append(f"   state: intimacy={req.state.intimacy:.2f}  match_heat={req.state.match_heat:.2f}  "
                f"팬심={req.state.fan_tier}(×{req.state.fan_factor:.2f})  prev_affect={req.state.prev_affect}")
+    arb.append(f"   열기(Arbiter 계산): {state.heat:.2f} → {req.state.heat:.2f}  "
+               f"(감쇠 후 경기 data 자극으로 가열)")
 
-    # ── ② Affect: 숫자로 기분 계산 (순수 함수) ──────────────────────────
+    # ── ② Affect: valence·salience 로 E·A 만 적분 (열기는 Arbiter 가 준 값 통과) ──
     new_state, output, _expr = affect(req, state, cfg, dt)
     base_E = req.state.prev_affect["E"]
     base_A = req.state.prev_affect["A"]
     E0 = _decay_toward(base_E, cfg.valence_bias, cfg.decay_E, dt)
     A0 = _decay_toward(base_A, 0.15, cfg.decay_A, dt)
-    heat0 = _decay_toward(state.heat, 0.0, cfg.decay_heat, dt)
-    aff = ["decay (prev_affect 가 기저로 식음, 열기는 0 으로)",
-           f"   E {base_E:+.2f}→{E0:+.2f}   A {base_A:.2f}→{A0:.2f}   "
-           f"열기 {state.heat:.2f}→{heat0:.2f}",
-           "", "integrate (valence·salience 는 Arbiter 가 준 값 → 곱해서 기분 갱신)"]
+    aff = ["decay (prev_affect 가 기저로 식음)",
+           f"   E {base_E:+.2f}→{E0:+.2f}   A {base_A:.2f}→{A0:.2f}",
+           "", "integrate (valence·salience 는 Arbiter 가 준 값 → 곱해서 E·A 갱신)"]
     for st in (req.primary, req.secondary):
         if st is None:
             continue
         dE = st.valence * st.salience * cfg.reactivity
         dA = st.salience * cfg.arousal_gain
-        heat_note = f", 열기 +{st.salience * cfg.heat_gain:.3f}" if st.type == "data" else ""
         aff.append(f"   {st.type:<8} valence {st.valence:+.2f}(arbiter) × salience {st.salience:.3f}(arbiter) "
-                   f"→ dE {dE:+.3f}, dA {dA:+.3f}{heat_note}")
+                   f"→ dE {dE:+.3f}, dA {dA:+.3f}")
     if req.primary is None:
         aff.append("   (반응할 자극 없음)")
     aff.append(f"   결과   E {output.E:+.2f}   A {output.A:.2f}   "
-               f"intensity {output.intensity:.2f}   열기 {new_state.heat:.2f}")
+               f"intensity {output.intensity:.2f}   열기 {new_state.heat:.2f}(Arbiter)")
     return "\n".join(arb), "\n".join(aff), req, output, new_state, winners
 
 
@@ -283,6 +282,7 @@ def compute(q: dict) -> dict:
             "primary": _stim_dict(req.primary), "secondary": _stim_dict(req.secondary),
             "path": req.path, "route": req.route, "deferred_ids": req.deferred_ids,
             "state": {"intimacy": req.state.intimacy, "match_heat": req.state.match_heat,
+                      "heat": req.state.heat,
                       "fan_tier": req.state.fan_tier, "fan_factor": req.state.fan_factor,
                       "prev_affect": req.state.prev_affect},
         },
