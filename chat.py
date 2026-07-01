@@ -12,8 +12,7 @@ from __future__ import annotations
 import os
 
 from config import PersonalityConfig
-from affect_engine import AffectState
-from arbiter import Candidate
+from arbiter import Candidate, AffectState
 from expression import Expression
 
 # 자유 발화 = 템플릿으로 못 막는 진짜 대화 -> LLM
@@ -93,7 +92,7 @@ def build_context(winner, state, expr, cfg) -> tuple[str, str]:
         f"[관계] 친밀도 {state.intimacy:.1f} → '{stage}'. {stage_dir}",
         f"[기분] 정서 E={state.E:+.2f} → {_mood_word(state.E)}. "
         f"세기 A={state.A:.2f} → 에너지는 '{expr.energy}'.",
-        f"[태도] 열기 {state.openness:.2f} → 말투 톤은 '{expr.tone}'. 표정 {expr.face}.",
+        f"[태도] 말투 톤은 '{expr.tone}'(친밀도 기반). 경기 열기 {state.heat:.2f}. 표정 {expr.face}.",
         "위 수치가 곧 너의 현재 상태다. 수치에 충실하게 한국어로 1~2문장만 말해라.",
     ])
     user_text = winner.payload.get("text", winner.kind)

@@ -1,28 +1,28 @@
 """
-arbiter.py — Riot 흡수 + 선택 (Affect 앞단)
-==========================================
-노션 'Arbiter → Affect 데이터 전달' 문서의 Arbiter 책임을 담는다.
+arbiter.py — 이벤트/발화 흡수부터 감정 계산까지 (단일 엔진)
+==========================================================
+소스층 자극을 받아 선택 → 값매기기 → 감정(E·A·열기) 적분까지 한 곳에서 한다.
+(예전엔 Arbiter / Affect 두 모듈이었지만 하나로 합쳤다.)
 
-  Riot 라이브 ─> Arbiter ─(AffectRequest)─> Affect ─> 표현층
+  자극 풀 ─> [선택·값매기기] ─> [감정 적분] E·A·열기 ─> 표현/채팅
 
-Arbiter 가 하는 일:
-  1) 변환  — Riot 원본 이벤트를 moment 로. 이벤트종류 → importance,
-             팀(killerTeamID/teamID) → valence, bounty·등급 → salience 부스터.
-  2) 선택  — salience 로 후보를 줄세워 승자(primary/secondary)를 고른다.
-             선택 정책(argmax / top_k)은 성격이 정한다.
-  3) 분기  — route.chat (말까지 할지)을 판단한다. Affect 는 이 값을 그대로 통과시킴.
-  4) 보류  — 진 자극은 deferred_ids 로 Backlog 회수.
-  5) 수집  — intimacy / match_heat / prev_affect 를 state 로 동봉.
+하는 일:
+  1) 변환    — Riot 원본 이벤트를 자극으로 (kind·intensity, 팀 → valence 부호).
+  2) 값매기기 — 자극종류 → valence, importance × 부스터 × 팬심 → salience.
+  3) 선택    — salience·성격가중치로 승자(primary/secondary)를 고른다.
+  4) 분기    — route.chat (말까지 할지)을 판단한다.
+  5) 적분    — valence·salience 로 감정 상태(E·A·열기)를 갱신한다 (구 Affect).
 
-핵심: Affect 엔 **valence·salience·match_heat 같은 숫자만** 넘긴다.
-      원본 killerTeamID·bounty·payload 등은 여기서만 쓰고 넘기지 않는다.
+감정 수학 자체는 게임을 몰라도 되는 순수 계산이지만, 게임 지식(팀·부스터·팬심)과
+한 모듈에 둔다 — 이벤트 하나가 감정까지 되는 흐름을 한 파일에서 읽을 수 있게.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import math
 
 from config import PersonalityConfig
+from expression import express, expression_intent
 
 
 # ===========================================================================
@@ -56,8 +56,10 @@ class Stim:
 
 @dataclass
 class ReqState:
-    intimacy: float = 0.0           # 친밀도 (관계)
+    intimacy: float = 0.0           # 친밀도 (유저↔캐릭터 관계)
     match_heat: float = 0.0         # 경기 열기 ← stats_update
+    fan_tier: str = "rookie"        # 유저↔팔로우팀 Fan심 등급 (표시/로그용)
+    fan_factor: float = 1.0         # 팔로우팀(data) 자극 salience 배율
     prev_affect: dict = field(default_factory=lambda: {"E": 0.0, "A": 0.15})
 
 
@@ -147,15 +149,41 @@ def appraisal_salience(c: Candidate) -> float:
     return importance_of(c) * booster(c)
 
 
+# ===========================================================================
+# 팬심(Fan심) — 유저↔팔로우팀 관여 깊이 → 팔로우팀 자극 salience 증폭기
+#   노션 '팬심' 문서: 누적 Fan심(상승만)을 등급으로 변환하고, 등급이 개인화
+#   ("Companion 이 더 뜨겁게 반응")를 좌우한다. 여기선 P0 범위 = 누적 등급만
+#   반영한다(모멘텀/열기는 후속). valence 는 건드리지 않고 '팔로우팀 관련
+#   자극(data)'의 salience(주목도)만 키운다 → 광팬일수록 우리 팀 이벤트에 더
+#   크게 반응(좋을 땐 더 기쁘게, 나쁠 땐 더 속상하게). 선택 순위(select_score)
+#   에는 관여하지 않는다.
+# ===========================================================================
+FAN_TIERS = [(8000, "die_hard"), (4000, "core"), (1500, "devoted"), (500, "follower")]
+FAN_FACTOR = {"rookie": 1.0, "follower": 1.15, "devoted": 1.30, "core": 1.50, "die_hard": 1.80}
+
+
+def fan_tier(cumulative: float) -> str:
+    """누적 Fan심 → 등급 코드 (팬심 문서 7절 경계값 초안)."""
+    for thr, name in FAN_TIERS:
+        if cumulative >= thr:
+            return name
+    return "rookie"
+
+
+def fan_factor(cumulative: float) -> float:
+    """등급 → 팔로우팀(data) 자극 salience 배율 (rookie 1.0 → die_hard 1.8)."""
+    return FAN_FACTOR[fan_tier(cumulative)]
+
+
 def affect_mod(kind: str, prev: dict) -> float:
     """직전 감정(prev_affect)이 '무엇에 끌리는가'를 변조 = 되먹임 통로.
     Affect 안이 아니라 Arbiter 에서, 지난 턴 결과로 계산한다(턴 내 순환 없음)."""
     E = prev.get("E", 0.0)
-    op = prev.get("openness", 0.0)
+    warmth = prev.get("warmth", 0.0)        # 친밀도 기반 친밀감(0~1)
     m = 1.0
-    # 열기가 낮으면 사교적 자극에 덜 끌림 (0.4 ~ 1.0)
+    # 아직 서먹하면(친밀도 낮음) 사교적 자극에 덜 끌림 (0.4 ~ 1.0)
     if kind in SOCIAL_KINDS:
-        m *= 0.4 + 0.6 * op
+        m *= 0.4 + 0.6 * warmth
     # mood-congruent: 기분 좋을 땐 긍정 자극, 나쁠 땐 부정 자극에 더 끌림
     if kind in ("game_positive", "compliment", "greeting"):
         m *= 1.0 + 0.3 * max(0.0, E)
@@ -246,12 +274,15 @@ def match_heat_from(candidates: list[Candidate]) -> float:
     return round(min(1.0, sum(c.intensity for c in data) / len(data)), 3)
 
 
-def _to_stim(c: Candidate, cfg: PersonalityConfig) -> Stim:
+def _to_stim(c: Candidate, cfg: PersonalityConfig, fan_factor: float = 1.0) -> Stim:
+    sal = appraisal_salience(c)
+    if stim_type(c) == "data":          # 팔로우팀 경기 이벤트에만 팬심 배율 적용
+        sal *= fan_factor
     return Stim(
         moment_id=c.moment_id or f"m_{c.kind}",
         type=stim_type(c),
         valence=round(valence_of(c), 3),
-        salience=round(appraisal_salience(c), 4),
+        salience=round(sal, 4),
         source=c.source,
         tags=tags_for(c),
     )
@@ -268,21 +299,24 @@ def build_request(
     candidates: list[Candidate],
     intimacy: float,
     prev_affect: dict,          # {"E":, "A":}
-    prev_openness: float,
     cfg: PersonalityConfig,
     user_spoke: bool,
     match_heat: float | None = None,
+    fan: float = 0.0,               # 누적 Fan심 (유저↔팔로우팀)
+    fan_target: bool = True,        # 팔로우팀이 있는가 (없으면 팬심 배율 무효)
     seed: int | None = None,
 ) -> tuple[AffectRequest, list[Candidate], list[Candidate]]:
     """후보 풀 → (AffectRequest, winners, losers).
     winners/losers 는 오케스트레이터(engine)가 표현·발화·Backlog 에 쓰도록 함께 반환."""
     prev = {"E": prev_affect.get("E", 0.0),
             "A": prev_affect.get("A", 0.15),
-            "openness": prev_openness}
+            "warmth": min(1.0, max(0.0, intimacy / 6.0))}  # 친밀도→친밀감(절친 6≈1.0)
     winners, losers = select(candidates, prev, cfg)
 
-    primary = _to_stim(winners[0], cfg) if winners else None
-    secondary = _to_stim(winners[1], cfg) if len(winners) > 1 else None
+    tier = fan_tier(fan)
+    ffac = fan_factor(fan) if fan_target else 1.0   # 팔로우팀 없으면 증폭 안 함
+    primary = _to_stim(winners[0], cfg, ffac) if winners else None
+    secondary = _to_stim(winners[1], cfg, ffac) if len(winners) > 1 else None
 
     req = AffectRequest(
         char_id=char_id,
@@ -297,6 +331,8 @@ def build_request(
         state=ReqState(
             intimacy=round(intimacy, 3),
             match_heat=match_heat if match_heat is not None else match_heat_from(candidates),
+            fan_tier=tier,
+            fan_factor=round(ffac, 3),
             prev_affect={"E": round(prev["E"], 3), "A": round(prev["A"], 3)},
         ),
     )
@@ -357,3 +393,85 @@ def map_event(p: dict, team: int = PERSPECTIVE_TEAM):
         win = p.get("winningTeam") == team
         return kind(win), 1.0, "게임 종료(승)" if win else "게임 종료(패)"
     return None
+
+
+# ===========================================================================
+# 감정 적분 (구 affect_engine) — valence·salience 숫자 → 기분 상태 E·A·열기
+#   위에서 만든 AffectRequest 를 받아 감정 상태를 갱신한다. 게임 룰은 이미 위에서
+#   숫자로 풀렸으므로 여기부턴 순수 계산이다. prev_affect 동봉으로 무상태 유지
+#   (같은 요청이면 같은 출력).
+# ===========================================================================
+@dataclass
+class AffectState:
+    E: float = 0.0         # 정서   -1~+1
+    A: float = 0.2         # 세기    0~1
+    heat: float = 0.0      # 열기(경기 열기, match heat) 0~1 — 뜨거운 경기로 오르고 식음
+    intimacy: float = 0.0  # 친밀도 누적치
+
+
+@dataclass
+class AffectOutput:
+    """감정 출력. 앞(표현/채팅)으로만 흐른다."""
+    E: float
+    A: float
+    intensity: float
+    expression_intent: dict          # 표현층 직행 (표정·이펙트·톤). 항상.
+    route: dict                      # 분기값 그대로 통과
+    path: str
+    tags: list[str] = field(default_factory=list)
+    moment_id: str | None = None
+
+
+def _decay_toward(value, baseline, rate, dt):
+    return baseline + (value - baseline) * math.exp(-rate * dt)
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _integrate(E, A, heat, valence, salience, is_data, cfg):
+    """valence·salience 한 쌍 → 기분 변화. data(경기)면 열기도 함께 달아오른다."""
+    strength = salience                  # 주목도(importance×부스터)가 곧 자극 세기
+    dE = valence * strength * cfg.reactivity
+    dA = strength * cfg.arousal_gain
+    E = _clamp(E + dE, -1.0, 1.0)
+    A = _clamp(A + dA, 0.0, 1.0)
+    if is_data:                          # 경기 이벤트만 열기를 올린다
+        heat = _clamp(heat + strength * cfg.heat_gain, 0.0, 1.0)
+    return E, A, heat
+
+
+def affect(req: AffectRequest, prev_state: AffectState,
+           cfg: PersonalityConfig, dt: float = 1.0):
+    """AffectRequest → (new_state, AffectOutput, Expression)."""
+    # (a) 감쇠 — 동봉된 prev_affect 기준으로 기저로 식음. 열기는 조용해지면 0 으로.
+    base_E = req.state.prev_affect.get("E", prev_state.E)
+    base_A = req.state.prev_affect.get("A", prev_state.A)
+    E = _decay_toward(base_E, cfg.valence_bias, cfg.decay_E, dt)
+    A = _decay_toward(base_A, 0.15, cfg.decay_A, dt)
+    heat = _decay_toward(prev_state.heat, 0.0, cfg.decay_heat, dt)
+
+    # (b) 적분 — primary(+secondary) 의 valence·salience 로 기분 갱신.
+    #     data(경기) 자극이면 열기도 함께 달아오른다.
+    for stim in (req.primary, req.secondary):
+        if stim is None:
+            continue
+        E, A, heat = _integrate(E, A, heat, stim.valence, stim.salience,
+                                stim.type == "data", cfg)
+
+    # (c) 종합 세기 — A 와 |E| 의 혼합 (노션 예: 0.5·A + 0.5·|E|)
+    intensity = round(_clamp(0.5 * A + 0.5 * abs(E), 0.0, 1.0), 3)
+
+    new_state = replace(prev_state, E=E, A=A, heat=heat)
+    expr = express(new_state)
+
+    output = AffectOutput(
+        E=round(E, 3), A=round(A, 3), intensity=intensity,
+        expression_intent=expression_intent(expr, new_state),
+        route=req.route,
+        path=req.path,
+        tags=(list(req.primary.tags) if req.primary else []),
+        moment_id=(req.primary.moment_id if req.primary else None),
+    )
+    return new_state, output, expr

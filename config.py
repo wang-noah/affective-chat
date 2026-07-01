@@ -26,10 +26,9 @@ class PersonalityConfig:
     arousal_gain: float = 1.0
     decay_E: float = 0.5
     decay_A: float = 0.7
-    warmup: float = 0.15
-    backlog_decay: float = 0.4
-    intimacy_gain: float = 0.7
-    intimacy_decay: float = 0.97
+    heat_gain: float = 0.6      # 경기(data) 자극 → 열기(match heat) 상승폭
+    decay_heat: float = 0.5     # 열기가 0으로 식는 속도
+    backlog_decay: float = 0.4  # 자극 나이(age)에 따른 최신성 감쇠
     # 정책 / 말투
     select_policy: SelectPolicy = field(default_factory=SelectPolicy)
     voice: dict = field(default_factory=dict)
@@ -52,10 +51,9 @@ def load_config(path: str) -> PersonalityConfig:
         arousal_gain=t.get("arousal_gain", 1.0),
         decay_E=t.get("decay_E", 0.5),
         decay_A=t.get("decay_A", 0.7),
-        warmup=t.get("warmup", 0.15),
+        heat_gain=t.get("heat_gain", 0.6),
+        decay_heat=t.get("decay_heat", 0.5),
         backlog_decay=t.get("backlog_decay", 0.4),
-        intimacy_gain=t.get("intimacy_gain", 0.7),
-        intimacy_decay=t.get("intimacy_decay", 0.97),
         select_policy=SelectPolicy(
             type=sp.get("type", "argmax"),
             threshold=sp.get("threshold", 0.20),
