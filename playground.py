@@ -10,19 +10,16 @@ playground.py — 소스층 컨트롤 패널 (입력 분리 + 결정론 대사)
   python3 playground.py        # -> http://localhost:8765
 """
 from __future__ import annotations
-import csv
 import json
 import math
 import os
-import sys
 
-csv.field_size_limit(sys.maxsize)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from config import load_config
 from affect_engine import AffectState, affect, _decay_toward
-from arbiter import (Candidate, build_request, select_score, affect_mod, map_event, fan_tier,
+from arbiter import (Candidate, build_request, select_score, affect_mod, fan_tier,
                      APPRAISAL_TABLE, importance_of, booster)
 from expression import express
 from engine import speech_primary
@@ -46,46 +43,6 @@ _KEYWORDS = [
     ("greeting",         ["안녕", "하이", "ㅎㅇ", "안뇽", "왔어", "또 왔", "잘 가", "잘가",
                           "바이", "ㅂㅂ", "반가", "오랜만"]),
 ]
-
-
-# ---- 실시간 델타: CSV 게임 이벤트 로딩 (변환 로직은 arbiter.map_event) -------
-# Riot 이벤트 → 자극 변환은 Arbiter 책임(arbiter.map_event). 여기선 CSV 를 읽어
-# 패널 드롭다운에 채우는 plumbing 만 한다.
-CSV_PATH = os.path.join(os.path.dirname(__file__), "raw_frame_202606281750.csv")
-
-# 원시 이벤트는 팀 무관하게 저장하고, 관점(team)별 매핑은 요청 때 한다.
-_EVT_KEYS = ("rfc461Schema", "monsterType", "killerTeamID", "victimTeamID", "teamID",
-             "winningTeam", "killer", "bounty", "buildingType", "turretTier",
-             "gameTime", "sequenceIndex")
-
-
-def load_events_raw(path: str = CSV_PATH, cap: int = 400):
-    out = []
-    if not os.path.exists(path):
-        return out
-    with open(path, newline="", encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
-            try:
-                p = json.loads(row["payload"])
-            except Exception:
-                continue
-            if map_event(p, 100) is None:    # notable 여부는 팀과 무관
-                continue
-            out.append({k: p.get(k) for k in _EVT_KEYS})
-    out.sort(key=lambda d: (d.get("gameTime") or 0))
-    return out[:cap]
-
-
-EVENTS_RAW = load_events_raw()
-
-
-def event_view(d: dict, team: int) -> dict:
-    """원시 이벤트 + 관점 팀 → {label, kind, intensity}."""
-    k, inten, desc = map_event(d, team)
-    gt = (d.get("gameTime") or 0) / 1000.0
-    sign = "○" if team == 0 else ("＋" if k == "game_positive" else "－")
-    return {"label": f"{int(gt // 60):02d}:{int(gt % 60):02d} {desc} {sign}",
-            "kind": k, "intensity": inten}
 
 
 def classify_kind(text: str) -> str:
@@ -285,17 +242,6 @@ def compute(q: dict) -> dict:
     intimacy = fv("intimacy", 0.0) if has("intimacy") else 0.0
     # 온톨로지 토픽
     onto = q["onto"][0] if has("onto") else ""
-    # 실시간 델타 (게임 이벤트): CSV 실데이터 우선, 없으면 합성 드롭다운
-    team = int(fv("team", 100))     # 관점 팀: 100 / 200 / 0(팔로우 없음)
-    evt_idx = q["evt"][0] if has("evt") and q["evt"][0] not in ("", "-1") else None
-    delta_label = None
-    if evt_idx is not None and EVENTS_RAW and 0 <= int(evt_idx) < len(EVENTS_RAW):
-        v = event_view(EVENTS_RAW[int(evt_idx)], team)
-        game, gint, delta_label = v["kind"], v["intensity"], "CSV " + v["label"]
-    else:
-        game = q["game"][0] if has("game") and q["game"][0] not in ("", "(없음)") else None
-        gint = fv("gint", 0.7)
-        delta_label = f"합성 {game}" if game else None
     # 팔로잉
     following = ["T1"] if (has("following") and q["following"][0] == "1") else []
     # 열기 (match heat, 경기 열기 시작값)
@@ -315,8 +261,6 @@ def compute(q: dict) -> dict:
         primary_kind = classify_kind(text) if auto else q.get("kind", ["smalltalk"])[0]
         pool.append(Candidate(primary_kind, 0.7, source="user",
                               payload=_payload_for(primary_kind, text)))
-    if game:
-        pool.append(Candidate(game, gint, source="delta", payload=_payload_for(game, "")))
     # 목표 엔진: 팔로잉 없음 + (친밀도<0.5 or 팬심 낮음=rookie) → 팔로우 유도
     goal_fired = False
     if not following and (intimacy < 0.5 or fan_tier(fan) == "rookie"):
@@ -327,8 +271,8 @@ def compute(q: dict) -> dict:
     history = [{"kind": primary_kind, "route": "T1", "text": ""} for _ in range(repeat)] \
         if primary_kind else []
 
-    # 팬심: 팔로우팀(관점 팀 ≠ 0)이 있을 때만 팔로우팀 자극 salience 증폭
-    fan_target = has("fan") and team != 0
+    # 팬심: 팔로우(following)했을 때만 팔로우팀 자극 salience 증폭
+    fan_target = has("fan") and bool(following)
     turn_id = "t_pg"
     tick = int(fv("tick", 0))
     arbiter_log, affect_log, req, output, next_state, winners, arbiter_view = \
@@ -379,7 +323,6 @@ def compute(q: dict) -> dict:
     row(has("fan"), "유저 팬심", fan_note)
     row(has("intimacy"), "친밀도", f"{intimacy:.1f}" if has("intimacy") else "(미입력→0)")
     row(has("onto"), "온톨로지", f'"{onto}" (표시용·미연결)' if has("onto") else "(미입력)")
-    row(game is not None, "실시간 델타", f"{delta_label} → {game} (강도 {gint:.2f})" if game else "(미입력/없음)")
     row(has("following"), "팔로잉", ("팔로우함" if following else "팔로우 안 함") if has("following") else "(미입력→없음)")
     row(has("heat"), "열기(경기)", f"{heat:.2f}" if has("heat") else "(미입력→0)")
     row(has("E"), "정서 E", f"{E:+.2f}" if has("E") else "(미입력→0)")
@@ -492,18 +435,6 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   <div class=src><div class=top><input type=checkbox class=use id=use_onto checked><label>온톨로지 토픽</label></div>
     <input type=text id=onto value="롤 e스포츠"></div>
 
-  <div class=src><div class=top><input type=checkbox class=use id=use_game checked><label>실시간 델타 (게임)</label><span class=v id=gintv></span></div>
-    <div class=sub2>관점 팀
-      <select id=team style="width:auto;display:inline-block;margin:0 0 0 6px;padding:3px 6px">
-        <option value=100>팀100 (우리)</option>
-        <option value=200>팀200</option>
-        <option value=0>팔로우 없음(중립)</option>
-      </select></div>
-    <select id=evt></select>
-    <select id=game></select>
-    <input type=range id=gint min=0 max=1 step=.05 value=.9>
-    <div class=sub2 id=evtnote>CSV 이벤트 선택 시 합성/강도 무시</div></div>
-
   <div class=src><div class=top><input type=checkbox class=use id=use_following checked><label>팔로잉</label></div>
     <div class=sub2><input type=checkbox id=following><label for=following style="font-weight:400">팀 팔로우함</label></div></div>
 
@@ -545,20 +476,6 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
 const KINDS = __KINDS__;
 const $=id=>document.getElementById(id);
 KINDS.forEach(k=>{const o=document.createElement('option');o.value=o.textContent=k;if(k==='user_distress')o.selected=true;$('kind').appendChild(o)});
-['(없음)','game_positive','game_negative'].forEach(k=>{const o=document.createElement('option');o.value=o.textContent=k;$('game').appendChild(o)});
-// CSV 실시간 델타 이벤트 채우기 (관점 팀에 따라 +/− 라벨이 바뀜)
-function loadEvents(){
-  const e=$('evt'); const prev=e.value;
-  fetch('/api/events?team='+$('team').value).then(r=>r.json()).then(list=>{
-    e.innerHTML='';
-    const o0=document.createElement('option');o0.value='-1';o0.textContent='(합성 사용)';e.appendChild(o0);
-    list.forEach((ev,i)=>{const o=document.createElement('option');o.value=i;o.textContent=ev.label+' ['+ev.kind.replace('game_','')+' '+ev.intensity+']';e.appendChild(o)});
-    e.value=prev && prev!=='' ? prev : '-1';   // 선택 인덱스 유지
-    $('evtnote').textContent='CSV 이벤트 '+list.length+'개 · 선택 시 합성/강도 무시';
-  });
-}
-$('team').addEventListener('change',()=>{loadEvents();dirty();});
-loadEvents();
 
 const COLOR={warm:'#f0883e',cool:'#58a6ff'};
 let lastResult=null;
@@ -572,7 +489,6 @@ function syncLabels(){
   $('iv').textContent=(+$('intimacy').value).toFixed(1);
   $('repeatv').textContent=$('repeat').value+'회';
   $('fanv').textContent=$('fan').value+'점';
-  $('gintv').textContent=(+$('gint').value).toFixed(2);
   $('kind').disabled=$('auto').checked;
 }
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
@@ -651,7 +567,6 @@ function run(){
   if($('use_fan').checked)P.set('fan',$('fan').value);
   if($('use_intimacy').checked)P.set('intimacy',$('intimacy').value);
   if($('use_onto').checked)P.set('onto',$('onto').value);
-  if($('use_game').checked){P.set('game',$('game').value);P.set('gint',$('gint').value);P.set('evt',$('evt').value);P.set('team',$('team').value);}
   if($('use_following').checked)P.set('following',$('following').checked?'1':'0');
   if($('use_heat').checked)P.set('heat',$('heat').value);
   if($('use_E').checked)P.set('E',$('E').value);
@@ -686,12 +601,6 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             html = HTML.replace("__KINDS__", json.dumps(KINDS, ensure_ascii=False))
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
-        elif parsed.path == "/api/events":
-            qs = parse_qs(parsed.query)
-            team = int(qs.get("team", ["100"])[0] or 100)
-            data = [event_view(d, team) for d in EVENTS_RAW]
-            self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"),
-                       "application/json; charset=utf-8")
         elif parsed.path == "/api/compute":
             data = compute(parse_qs(parsed.query))
             self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"),
@@ -704,7 +613,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8765"))
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"▶ 소스층 컨트롤 패널: http://localhost:{port}  (Ctrl+C 종료)")
-    print(f"  캐릭터: {CFG.name} ({CFG.archetype}) · 실시간 델타 이벤트 {len(EVENTS_RAW)}개 로드")
+    print(f"  캐릭터: {CFG.name} ({CFG.archetype})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
