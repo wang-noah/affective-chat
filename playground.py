@@ -245,23 +245,39 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     base_A = req.state.prev_affect["A"]
     E0 = _decay_toward(base_E, cfg.valence_bias, cfg.decay_E, dt)
     A0 = _decay_toward(base_A, 0.15, cfg.decay_A, dt)
+    # 원본 트레이스 로그(디버그용, 평문) — 구조화 뷰(affect_view)가 주 표시, 이건 <details> 폴백
     aff = ["decay (prev_affect 가 기저로 식음)",
-           f"   E(정서) {base_E:+.2f}→<b class=q>{E0:+.2f}</b>   A(세기) {base_A:.2f}→<b class=q>{A0:.2f}</b>",
+           f"   E(정서) {base_E:+.2f}→{E0:+.2f}   A(세기) {base_A:.2f}→{A0:.2f}",
            "", "integrate (valence·salience 는 Arbiter 가 준 값 → 곱해서 E·A 갱신)"]
-    for st in (req.primary, req.secondary):
+    int_rows = []
+    stim_pairs = [("primary", req.primary, winners[0] if winners else None),
+                  ("secondary", req.secondary, winners[1] if len(winners) > 1 else None)]
+    for slot, st, cand in stim_pairs:
         if st is None:
             continue
         dE = st.valence * st.salience * cfg.reactivity
         dA = st.salience * cfg.arousal_gain
-        aff.append(f"   {st.type:<8} valence <b class=v>{st.valence:+.2f}</b>(arbiter) × "
-                   f"salience <b class=v>{st.salience:.3f}</b>(arbiter) "
-                   f"→ dE <b class=q>{dE:+.3f}</b>, dA <b class=q>{dA:+.3f}</b>")
+        aff.append(f"   {st.type:<8} valence {st.valence:+.2f}(arbiter) × "
+                   f"salience {st.salience:.3f}(arbiter) → dE {dE:+.3f}, dA {dA:+.3f}")
+        int_rows.append({"slot": slot, "type": st.type,
+                         "kind": (cand.kind if cand else st.type),
+                         "valence": round(st.valence, 3), "salience": round(st.salience, 4),
+                         "dE": round(dE, 3), "dA": round(dA, 3)})
     if req.primary is None:
         aff.append("   (반응할 자극 없음)")
-    aff.append(f"<span class=res>   결과   E(정서) <b class=hi>{output.E:+.2f}</b>   A(세기) <b class=hi>{output.A:.2f}</b>   "
-               f"intensity(종합세기) <b class=hi>{output.intensity:.2f}</b>   "
-               f"열기(경기) <b class=hi>{new_state.heat:.2f}</b>(Arbiter)</span>")
-    return "\n".join(arb), "\n".join(aff), req, output, new_state, winners, arbiter_view
+    aff.append(f"   결과   E(정서) {output.E:+.2f}   A(세기) {output.A:.2f}   "
+               f"intensity(종합세기) {output.intensity:.2f}   열기(경기) {new_state.heat:.2f}(Arbiter)")
+
+    # 구조화 뷰 (Affect: 감쇠 → 적분 → 결과) — Arbiter 뷰와 동일한 3-스텝 레이아웃
+    affect_view = {
+        "decay": {"E_prev": round(base_E, 3), "E_now": round(E0, 3),
+                  "A_prev": round(base_A, 3), "A_now": round(A0, 3),
+                  "valence_bias": round(cfg.valence_bias, 2)},
+        "integrate": int_rows,
+        "output": {"E": output.E, "A": output.A, "intensity": output.intensity,
+                   "heat": round(new_state.heat, 3)},
+    }
+    return "\n".join(arb), "\n".join(aff), req, output, new_state, winners, arbiter_view, affect_view
 
 
 def compute(q: dict) -> dict:
@@ -333,7 +349,7 @@ def compute(q: dict) -> dict:
     fan_target = has("fan") and team != 0
     turn_id = "t_pg"
     tick = int(fv("tick", 0))
-    arbiter_log, affect_log, req, output, next_state, winners, arbiter_view = \
+    arbiter_log, affect_log, req, output, next_state, winners, arbiter_view, affect_view = \
         trace_turn(state, pool, CFG, turn_id, tick, user_spoke, fan=fan, fan_target=fan_target)
     trace_result = {"E": output.E, "A": output.A, "heat": round(next_state.heat, 3)}
 
@@ -398,7 +414,7 @@ def compute(q: dict) -> dict:
         "kind_used": primary_kind or "", "auto": auto,
         "source_log": "\n".join(src),
         "trace_arbiter": arbiter_log, "trace_affect": affect_log,
-        "arbiter_view": arbiter_view,
+        "arbiter_view": arbiter_view, "affect_view": affect_view,
         "trace_result": trace_result,
     }
 
@@ -438,11 +454,14 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   .card.arb h2{color:#58a6ff}.card.aff h2{color:#d2a8ff}.card.src h2{color:#3fb950}
   pre{margin:0;white-space:pre-wrap;font:12.5px/1.6 ui-monospace,Menlo,monospace;color:#adbac7}
   pre.affjson{color:#7ee787}
-  /* affect 로그 강조: v=Arbiter가 준 입력(파랑) · q=Affect가 계산한 값(보라) · hi/res=최종 결과 */
-  pre#aff .v{color:#58a6ff;font-weight:700}
-  pre#aff .q{color:#d2a8ff;font-weight:700}
-  pre#aff .hi{color:#fff;font-weight:700}
-  pre#aff .res{background:#d2a8ff1f;border-left:3px solid #d2a8ff;border-radius:4px}
+  /* ── 어펙트 구조화 뷰 (감쇠 → 적분 → 결과), Arbiter 뷰(.arbview) 스타일 재사용 ── */
+  .affview{font-size:12.5px}
+  .affview .ahd{color:#d2a8ff}
+  .affview .atbl td.apos{color:#3fb950;font-weight:700}
+  .affview .atbl td.aneg{color:#f85149;font-weight:700}
+  .affview .abadge.big{font-size:13px;padding:7px 12px;background:#d2a8ff14;border-color:#d2a8ff55}
+  .affview .abadge.big b{color:#fff;font-size:15px;margin-left:4px}
+  .affview .abadge.big small{color:#8b949e;font-size:10px;margin-left:3px}
   .user{color:#8b949e;font-size:13px;margin-bottom:6px}
   .dialogue{font-size:19px;font-weight:700;color:#7ee787}
   .mode{float:right;font-size:11px;color:#8b949e;font-weight:400;text-transform:none}
@@ -541,7 +560,9 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
     <div class="card arb"><h2>① Arbiter — 선별·값매기기 <span style="float:right;font-weight:400;text-transform:none;color:#8b949e">노션 §4 기준</span></h2>
       <div id=arb class=arbview></div>
       <details class=araw><summary>원본 트레이스 로그</summary><pre id=arbraw></pre></details></div>
-    <div class="card aff"><h2>② Affect Engine <button id=applyTurn style="float:right;width:auto;margin:0;padding:3px 9px;font-size:11px">▶ 이 턴 적용</button></h2><pre id=aff></pre></div>
+    <div class="card aff"><h2>② Affect Engine — 감쇠·적분·결과 <button id=applyTurn style="float:right;width:auto;margin:0;padding:3px 9px;font-size:11px">▶ 이 턴 적용</button></h2>
+      <div id=aff class=affview></div>
+      <details class=araw><summary>원본 트레이스 로그</summary><pre id=affraw></pre></details></div>
   </div>
 
   <div class=card><h2>대사 = affect engine 출력 (JSON · LLM 0)</h2>
@@ -634,6 +655,46 @@ function renderArb(a){
   h+='</div></div>';
   return h;
 }
+// 어펙트 구조화 렌더 — 감쇠 → 적분 → 결과 (Arbiter 뷰와 동일한 3-스텝)
+function d3(n){return (n>=0?'+':'')+n.toFixed(3);}
+function renderAff(a){
+  if(!a)return '';
+  let h='';
+  // ① 감쇠
+  h+='<div class=astep><div class=ahd>① 감쇠 — 직전 감정이 기저로 식음<small>자극 반영 전, dt만큼 기저값으로 지수 감쇠</small></div>';
+  h+='<div class=astim>';
+  h+=`<div class=arow><span class=alab>E(정서)</span>`
+    +`<span class="aval ${a.decay.E_now>=0?'pos':'neg'}">${sgn(a.decay.E_now)}</span>`
+    +`<span class=aeq>${sgn(a.decay.E_prev)} → 기저 ${sgn(a.decay.valence_bias)}</span></div>`;
+  h+=`<div class=arow><span class=alab>A(세기)</span>`
+    +`<span class="aval sal">${a.decay.A_now.toFixed(2)}</span>`
+    +`<span class=aeq>${a.decay.A_prev.toFixed(2)} → 기저 0.15</span></div>`;
+  h+='</div></div>';
+  // ② 적분
+  h+='<div class=astep><div class=ahd>② 적분 — 자극을 감정에 더함<small>dE = valence × salience × 반응성 · dA = salience × 각성이득</small></div>';
+  if(!a.integrate.length){h+='<div class=amuted>반응할 자극 없음 — 감쇠만 적용</div>';}
+  else{
+    h+='<table class=atbl><thead><tr><th>자극</th><th>valence</th><th>salience</th><th>→ dE</th><th>→ dA</th></tr></thead><tbody>';
+    a.integrate.forEach(s=>{
+      h+=`<tr><td class=akind>${esc(s.kind)} <span class=amuted>${esc(s.type)}</span></td>`
+        +`<td class="${s.valence>=0?'apos':'aneg'}">${sgn(s.valence)}</td>`
+        +`<td>${s.salience.toFixed(3)}</td>`
+        +`<td class="${s.dE>=0?'apos':'aneg'}">${d3(s.dE)}</td>`
+        +`<td class=apos>${d3(s.dA)}</td></tr>`;
+    });
+    h+='</tbody></table>';
+    h+='<div class=amuted>valence·salience 는 Arbiter 가 준 값 (Affect 는 곱하기만 함)</div>';
+  }
+  h+='</div>';
+  // ③ 결과
+  h+='<div class=astep><div class=ahd>③ 결과 — 표현·채팅으로 나가는 최종값</div><div class=abadges>';
+  h+=`<span class="abadge big">E 정서 <b>${sgn(a.output.E)}</b></span>`;
+  h+=`<span class="abadge big">A 세기 <b>${a.output.A.toFixed(2)}</b></span>`;
+  h+=`<span class="abadge big">종합세기 <b>${a.output.intensity.toFixed(2)}</b></span>`;
+  h+=`<span class="abadge big">열기 <b>${a.output.heat.toFixed(2)}</b><small>경기·Arbiter</small></span>`;
+  h+='</div></div>';
+  return h;
+}
 function render(d){
   $('face').textContent=d.face;
   $('b_tone').textContent='톤 · '+d.tone;
@@ -645,7 +706,8 @@ function render(d){
   $('srclog').textContent=d.source_log;
   $('arb').innerHTML=renderArb(d.arbiter_view);
   $('arbraw').textContent=d.trace_arbiter;
-  $('aff').innerHTML=d.trace_affect;
+  $('aff').innerHTML=renderAff(d.affect_view);
+  $('affraw').textContent=d.trace_affect;
   $('affjson').textContent=JSON.stringify(d.affect_output,null,2);
   if(d.auto&&d.kind_used)$('kind').value=d.kind_used;
   lastResult=d.trace_result;
