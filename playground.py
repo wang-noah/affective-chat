@@ -512,11 +512,6 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   .stage{color:#d2a8ff;font-weight:700;margin:0}
   .stage small{display:block;color:#8b949e;font-weight:400;font-size:12px}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:1100px){.grid2{grid-template-columns:1fr}}
-  /* 소스 요약(좌) + 배치 결과(우) 한 행 — 폭 부족하면 배치가 아래로 줄바꿈(레이아웃 안 깨짐) */
-  .srcrow{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
-  .srcrow>.card{margin:0}
-  .srcrow>.card.src{flex:1 1 300px;min-width:260px}
-  .srcrow>.card.batch{flex:3 1 820px}
   .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:15px;margin-top:0}
   .card.arb{border-color:#1f6feb55}.card.aff{border-color:#d2a8ff55}.card.src{border-color:#2ea04355}
   .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin:0 0 9px}
@@ -655,11 +650,7 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
     <div class=stage id=stage></div>
   </div>
 
-  <div class=srcrow>
-    <div class="card src"><h2>소스층 입력 요약 (이번 SEND)</h2><pre id=srclog></pre></div>
-    <div class="card batch" id=batchcard style="display:none"><h2>배치 시뮬레이션 — 델타 누적 <span id=batchsum style="float:right;font-weight:400;text-transform:none;color:#8b949e"></span></h2>
-      <div style="overflow-x:auto"><table class="atbl batchtbl" id=batchtbl></table></div></div>
-  </div>
+  <div class="card src"><h2>소스층 입력 요약 (이번 SEND)</h2><pre id=srclog></pre></div>
 
   <div class=grid2>
     <div class="card arb"><h2>① Arbiter — 선별·값매기기 <span style="float:right;font-weight:400;text-transform:none;color:#8b949e">노션 §4 기준</span></h2>
@@ -669,6 +660,9 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
       <div id=aff class=affview></div>
       <details class=araw><summary>원본 트레이스 로그</summary><pre id=affraw></pre></details></div>
   </div>
+
+  <div class="card batch" id=batchcard style="display:none"><h2>배치 시뮬레이션 — 델타 누적 <span id=batchsum style="float:right;font-weight:400;text-transform:none;color:#8b949e"></span></h2>
+    <div style="overflow-x:auto"><table class="atbl batchtbl" id=batchtbl></table></div></div>
 
   <div class=card><h2>대사 = affect engine 출력 (JSON · LLM 0)</h2>
     <pre id=affjson class=affjson></pre></div>
