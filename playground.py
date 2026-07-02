@@ -345,8 +345,8 @@ def compute(q: dict) -> dict:
     history = [{"kind": primary_kind, "route": "T1", "text": ""} for _ in range(repeat)] \
         if primary_kind else []
 
-    # 팬심: 팔로우팀(관점 팀 ≠ 0)이 있을 때만 팔로우팀 자극 salience 증폭
-    fan_target = has("fan") and team != 0
+    # 팬심: 팔로우(following)했을 때만 팔로우팀 자극 salience 증폭 (develop PR#6 정합)
+    fan_target = has("fan") and bool(following)
     turn_id = "t_pg"
     tick = int(fv("tick", 0))
     arbiter_log, affect_log, req, output, next_state, winners, arbiter_view, affect_view = \
