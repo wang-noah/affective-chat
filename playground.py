@@ -419,16 +419,80 @@ def compute(q: dict) -> dict:
     }
 
 
+def compute_batch(q: dict) -> dict:
+    """실시간 델타 여러 개를 연속 턴으로 실행 — 각 턴 결과(E·A·열기)를 다음 턴 입력으로
+    되먹여(= '이 턴 적용' 자동 반복) 누적 변화를 한 번에 보여준다. 델타만, 유저 발화 없음."""
+    def fv(name, default):
+        try:
+            return float(q[name][0])
+        except (KeyError, TypeError, ValueError):
+            return default
+
+    idxs = []
+    if "evts" in q and q["evts"][0]:
+        for x in q["evts"][0].split(","):
+            try:
+                idxs.append(int(x))
+            except ValueError:
+                continue
+    team = int(fv("team", 100))
+    intimacy = fv("intimacy", 0.0)
+    fan = fv("fan", 0.0)
+    fan_target = ("fan" in q) and team != 0
+    E, A, heat = fv("E", 0.0), fv("A", 0.15), fv("heat", 0.0)
+
+    state = AffectState(E=E, A=A, heat=heat, intimacy=intimacy)
+    rows = []
+    for i, idx in enumerate(idxs):
+        if not (EVENTS_RAW and 0 <= idx < len(EVENTS_RAW)):
+            continue
+        v = event_view(EVENTS_RAW[idx], team)
+        game, gint = v["kind"], v["intensity"]
+        pool = [Candidate(game, gint, source="delta", payload=_payload_for(game, ""))]
+        _al, _fl, _req, output, next_state, _win, _av, affect_view = trace_turn(
+            state, pool, CFG, f"t_b{i}", i, user_spoke=False, fan=fan, fan_target=fan_target)
+        integ = affect_view["integrate"][0] if affect_view["integrate"] else {}
+        rows.append({
+            "turn": i + 1, "idx": idx, "label": v["label"], "kind": game,
+            "valence": integ.get("valence"), "salience": integ.get("salience"),
+            "dE": integ.get("dE", 0.0), "dA": integ.get("dA", 0.0),
+            "E": output.E, "A": output.A, "intensity": output.intensity,
+            "heat": round(next_state.heat, 3),
+        })
+        state = next_state
+
+    return {"rows": rows,
+            "start": {"E": round(E, 3), "A": round(A, 3), "heat": round(heat, 3),
+                      "intimacy": round(intimacy, 2)},
+            "end": ({"E": rows[-1]["E"], "A": rows[-1]["A"], "heat": rows[-1]["heat"]}
+                    if rows else None)}
+
+
 HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>루나 — 소스층 컨트롤 패널</title>
+<title>__CHAR__ · Affect 대시보드</title>
 <style>
   :root{color-scheme:dark}*{box-sizing:border-box}
   body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif;background:#0e1116;color:#e6edf3}
   .wrap{display:grid;grid-template-columns:360px 1fr;min-height:100vh}
   .panel{background:#161b22;border-right:1px solid #30363d;padding:20px;overflow:auto}
-  .out{padding:24px;overflow:auto}
+  .out{padding:22px;overflow:auto;display:flex;flex-direction:column;gap:16px}
   h1{font-size:15px;margin:0 0 2px}.sub{color:#8b949e;font-size:12px;margin-bottom:14px}
+  /* ── 대시보드 헤더 + KPI 타일 + 표현 스트립 ── */
+  .dashhead{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;flex-wrap:wrap;border-bottom:1px solid #21262d;padding-bottom:12px}
+  .dashhead h1{font-size:18px;margin:0}
+  .dashhead .dsub{color:#8b949e;font-size:12px;margin-top:3px}
+  .dashhead #hint{margin:0;text-align:right}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:12px}
+  .kpi{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:13px 15px;display:flex;flex-direction:column;gap:7px;position:relative;overflow:hidden}
+  .kpi::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:#30363d}
+  .kpi.k-E::before{background:#3fb950}.kpi.k-A::before{background:#58a6ff}.kpi.k-int::before{background:#d2a8ff}.kpi.k-heat::before{background:#f0883e}
+  .kpi .klab{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#8b949e}
+  .kpi .kval{font-size:27px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1;color:#e6edf3}
+  .kpi .ksub{font-size:11px;color:#8b949e;min-height:14px}
+  .kpi.k-face .face{font-size:46px;line-height:1;margin:0;text-align:left}
+  .exprbar{display:flex;align-items:center;gap:18px;flex-wrap:wrap;background:#161b22;border:1px solid #30363d;border-radius:12px;padding:11px 16px}
+  .exprbar .elab{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#8b949e;margin-right:4px}
   .grp{margin:18px 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#d2a8ff;border-top:1px solid #30363d;padding-top:14px}
   .src{margin:11px 0}
   .src .top{display:flex;align-items:center;gap:7px}
@@ -441,14 +505,19 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   button{margin-top:6px;width:100%;padding:8px;border:1px solid #30363d;border-radius:7px;background:#21262d;color:#e6edf3;cursor:pointer;font-size:12px}
   button:hover{background:#30363d}
   #send{margin-top:20px;background:#238636;border-color:#2ea043;color:#fff;font-size:14px;font-weight:700;padding:11px}
-  .face{font-size:78px;line-height:1;text-align:center;margin:4px 0}
-  .badges{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:6px}
+  .face{font-size:46px;line-height:1;margin:0}
+  .badges{display:flex;gap:8px;flex-wrap:wrap;margin:0}
   .badge{padding:4px 12px;border-radius:999px;font-size:12px;font-weight:700;background:#21262d;border:1px solid #30363d}
-  .dots{text-align:center;font-size:20px;letter-spacing:3px;height:24px}
-  .stage{text-align:center;color:#d2a8ff;font-weight:700;margin:6px 0 2px}
+  .dots{font-size:18px;letter-spacing:3px;min-height:20px;min-width:18px}
+  .stage{color:#d2a8ff;font-weight:700;margin:0}
   .stage small{display:block;color:#8b949e;font-weight:400;font-size:12px}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:1100px){.grid2{grid-template-columns:1fr}}
-  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:15px;margin-top:16px}
+  /* 소스 요약(좌) + 배치 결과(우) 한 행 — 폭 부족하면 배치가 아래로 줄바꿈(레이아웃 안 깨짐) */
+  .srcrow{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+  .srcrow>.card{margin:0}
+  .srcrow>.card.src{flex:1 1 300px;min-width:260px}
+  .srcrow>.card.batch{flex:3 1 820px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:15px;margin-top:0}
   .card.arb{border-color:#1f6feb55}.card.aff{border-color:#d2a8ff55}.card.src{border-color:#2ea04355}
   .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin:0 0 9px}
   .card.arb h2{color:#58a6ff}.card.aff h2{color:#d2a8ff}.card.src h2{color:#3fb950}
@@ -462,6 +531,19 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   .affview .abadge.big{font-size:13px;padding:7px 12px;background:#d2a8ff14;border-color:#d2a8ff55}
   .affview .abadge.big b{color:#fff;font-size:15px;margin-left:4px}
   .affview .abadge.big small{color:#8b949e;font-size:10px;margin-left:3px}
+  /* ── 배치 시뮬레이션 대시보드 ── */
+  .card.batch{border-color:#a371f755}.card.batch h2{color:#d2a8ff}
+  /* 배치 테이블은 공용 .atbl 의 width:100% 를 덮어 콘텐츠 폭으로 — 넓은 화면에서 컬럼이 벌어지지 않게 */
+  .card.batch .batchtbl{font-size:12px;width:auto;min-width:820px}
+  .batchtbl th{white-space:nowrap}
+  .batchtbl td.akind{white-space:nowrap}
+  .batchtbl td.turn{color:#6e7681;text-align:center}
+  .batchtbl td.apos{color:#3fb950;font-weight:700}.batchtbl td.aneg{color:#f85149;font-weight:700}
+  .batchtbl td.lab{text-align:left;color:#8b949e;font-size:11px;white-space:nowrap}
+  .bar{position:relative;display:inline-block;vertical-align:middle;width:80px;height:12px;background:#0e1116;border-radius:3px}
+  .bar i{position:absolute;top:0;bottom:0;border-radius:3px;display:block}
+  .bar .mid{position:absolute;left:50%;top:-1px;bottom:-1px;width:1px;background:#30363d}
+  .barlab{font-variant-numeric:tabular-nums;font-weight:700;margin-left:6px}
   .user{color:#8b949e;font-size:13px;margin-bottom:6px}
   .dialogue{font-size:19px;font-weight:700;color:#7ee787}
   .mode{float:right;font-size:11px;color:#8b949e;font-weight:400;text-transform:none}
@@ -527,8 +609,12 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
       </select></div>
     <select id=evt></select>
     <select id=game></select>
-    <input type=range id=gint min=0 max=1 step=.05 value=.9>
-    <div class=sub2 id=evtnote>CSV 이벤트 선택 시 합성/강도 무시</div></div>
+    <div class=sub2><label id=glabel style="flex:none;font-weight:400">합성 강도</label>
+      <input type=range id=gint min=0 max=1 step=.05 value=.9 style="margin-top:0"></div>
+    <div class=sub2 id=evtnote>CSV 이벤트 선택 시 합성/강도 무시</div>
+    <div class=sub2 style="margin-top:7px;border-top:1px dashed #30363d;padding-top:7px">
+      선택 이벤트부터 <input type=number id=batchn min=1 max=60 value=12 style="width:56px;margin:0;padding:3px 5px;display:inline-block"> 개 연속
+      <button id=batchrun style="width:auto;margin:0 0 0 auto;padding:4px 10px;background:#8957e5;border-color:#a371f7;color:#fff;font-weight:700">▶ 배치</button></div></div>
 
   <div class=src><div class=top><input type=checkbox class=use id=use_following checked><label>팔로잉</label></div>
     <div class=sub2><input type=checkbox id=following><label for=following style="font-weight:400">팀 팔로우함</label></div></div>
@@ -543,18 +629,37 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
     <input type=range id=A min=0 max=1 step=.05 value=.4></div>
 
   <button id=send>▶ SEND — 한 턴 실행</button>
-  <div id=hint></div>
  </div>
 
  <div class=out>
-  <div class=face id=face>😐</div>
-  <div class=badges>
-    <span class=badge id=b_tone>tone</span><span class=badge id=b_energy>energy</span><span class=badge id=b_color>color</span>
+  <div class=dashhead>
+    <div><h1>__CHAR__ · Affect 대시보드</h1>
+      <div class=dsub>__ARCH__ · 소스층 → Arbiter → Affect → 표현 한 턴 파이프라인</div></div>
+    <div id=hint></div>
   </div>
-  <div class=dots id=dots></div>
-  <div class=stage id=stage></div>
 
-  <div class="card src"><h2>소스층 입력 요약 (이번 SEND)</h2><pre id=srclog></pre></div>
+  <div class=kpis>
+    <div class="kpi k-face"><div class=klab>표정</div><div class=face id=face>😐</div></div>
+    <div class="kpi k-E"><div class=klab>E · 정서</div><div class=kval id=kpi_E>–</div><div class=ksub id=kpi_Es>방향</div></div>
+    <div class="kpi k-A"><div class=klab>A · 세기</div><div class=kval id=kpi_A>–</div><div class=ksub id=kpi_As>각성</div></div>
+    <div class="kpi k-int"><div class=klab>종합세기</div><div class=kval id=kpi_int>–</div><div class=ksub>0.5·A + 0.5·|E|</div></div>
+    <div class="kpi k-heat"><div class=klab>열기 · 경기</div><div class=kval id=kpi_heat>–</div><div class=ksub id=kpi_heats>Arbiter 계산</div></div>
+  </div>
+
+  <div class=exprbar>
+    <span class=elab>표현</span>
+    <div class=badges>
+      <span class=badge id=b_tone>tone</span><span class=badge id=b_energy>energy</span><span class=badge id=b_color>color</span>
+    </div>
+    <div class=dots id=dots></div>
+    <div class=stage id=stage></div>
+  </div>
+
+  <div class=srcrow>
+    <div class="card src"><h2>소스층 입력 요약 (이번 SEND)</h2><pre id=srclog></pre></div>
+    <div class="card batch" id=batchcard style="display:none"><h2>배치 시뮬레이션 — 델타 누적 <span id=batchsum style="float:right;font-weight:400;text-transform:none;color:#8b949e"></span></h2>
+      <div style="overflow-x:auto"><table class="atbl batchtbl" id=batchtbl></table></div></div>
+  </div>
 
   <div class=grid2>
     <div class="card arb"><h2>① Arbiter — 선별·값매기기 <span style="float:right;font-weight:400;text-transform:none;color:#8b949e">노션 §4 기준</span></h2>
@@ -583,6 +688,7 @@ function loadEvents(){
     list.forEach((ev,i)=>{const o=document.createElement('option');o.value=i;o.textContent=ev.label+' ['+ev.kind.replace('game_','')+' '+ev.intensity+']';e.appendChild(o)});
     e.value=prev && prev!=='' ? prev : '-1';   // 선택 인덱스 유지
     $('evtnote').textContent='CSV 이벤트 '+list.length+'개 · 선택 시 합성/강도 무시';
+    syncDeltaMode();
   });
 }
 $('team').addEventListener('change',()=>{loadEvents();dirty();});
@@ -602,6 +708,13 @@ function syncLabels(){
   $('fanv').textContent=$('fan').value+'점';
   $('gintv').textContent=(+$('gint').value).toFixed(2);
   $('kind').disabled=$('auto').checked;
+  syncDeltaMode();
+}
+// CSV 이벤트가 선택돼 있으면(evt≠-1) 합성 델타·강도는 무시되므로 회색 비활성화
+function syncDeltaMode(){
+  const csv = $('evt').value!=='-1' && $('evt').value!=='';
+  [$('game'),$('gint')].forEach(el=>{el.disabled=csv;el.style.opacity=csv?0.4:1;});
+  $('glabel').style.opacity=csv?0.4:1;
 }
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 function sgn(n){return (n>=0?'+':'')+n.toFixed(2);}
@@ -703,6 +816,15 @@ function render(d){
   $('b_color').style.borderColor=COLOR[d.effect_color];
   $('dots').textContent='●'.repeat(d.particles);$('dots').style.color=COLOR[d.effect_color];
   $('stage').innerHTML='친밀도 단계: '+d.stage+'<small>'+d.stage_dir+'</small>';
+  // KPI 타일 — Affect 최종 출력값(표현층 임계와 동일 기준)
+  const o=d.affect_view.output;
+  $('kpi_E').textContent=sgn(o.E);$('kpi_E').style.color=o.E>=0?'#3fb950':'#f85149';
+  $('kpi_Es').textContent=o.E>0.25?'좋음 😊':(o.E<-0.25?'나쁨 😒':'평온 😐');
+  $('kpi_A').textContent=o.A.toFixed(2);
+  $('kpi_As').textContent=o.A>0.66?'들뜸 excited':(o.A>0.33?'활기 lively':'차분 calm');
+  $('kpi_int').textContent=o.intensity.toFixed(2);
+  $('kpi_heat').textContent=o.heat.toFixed(2);$('kpi_heat').style.color=o.heat>0.66?'#f0883e':'#e6edf3';
+  $('kpi_heats').textContent=o.heat>0.66?'🔥 뜨거움':'Arbiter 계산';
   $('srclog').textContent=d.source_log;
   $('arb').innerHTML=renderArb(d.arbiter_view);
   $('arbraw').textContent=d.trace_arbiter;
@@ -735,6 +857,58 @@ $('applyTurn').addEventListener('click',()=>{if(!lastResult)return;
   $('use_E').checked=$('use_A').checked=$('use_heat').checked=true;
   $('E').value=lastResult.E;$('A').value=lastResult.A;$('heat').value=lastResult.heat;
   syncLabels();setHint('● 결과 상태 적용됨 — SEND 로 다음 턴');});
+
+// ── 배치 시뮬레이션: 선택 CSV 이벤트부터 N개를 연속 턴으로 실행 → 표로 누적 변화 ──
+function ebar(v){ // E: -1~+1, 중앙 기준 좌우 바
+  const p=Math.max(-1,Math.min(1,v)), w=Math.abs(p)*50;
+  const col=p>=0?'#3fb950':'#f85149', side=p>=0?`left:50%;width:${w}%`:`right:50%;width:${w}%`;
+  return `<span class=bar><span class=mid></span><i style="${side};background:${col}"></i></span>`
+    +`<span class=barlab style="color:${col}">${sgn(v)}</span>`;
+}
+function hbar(v){ // 열기: 0~1
+  const w=Math.max(0,Math.min(1,v))*100;
+  return `<span class=bar><i style="left:0;width:${w}%;background:#f0883e"></i></span>`
+    +`<span class=barlab style="color:#f0883e">${v.toFixed(2)}</span>`;
+}
+function renderBatch(d){
+  const t=$('batchtbl');
+  if(!d.rows.length){t.innerHTML='<tbody><tr><td class=amuted style="padding:10px">실행된 이벤트 없음 — CSV 이벤트가 로드되지 않았을 수 있음</td></tr></tbody>';
+    $('batchcard').style.display='';$('batchsum').textContent='';return;}
+  let h='<thead><tr><th>턴</th><th class=lab>이벤트</th><th>자극</th><th>valence</th><th>salience</th><th>→ dE</th>'
+    +'<th style="text-align:left">E (정서) 누적</th><th>A</th><th>종합</th><th style="text-align:left">열기 누적</th></tr></thead><tbody>';
+  d.rows.forEach(r=>{
+    h+=`<tr><td class=turn>${r.turn}</td><td class=lab>${esc(r.label)}</td>`
+      +`<td class=akind>${esc(r.kind.replace('game_',''))}</td>`
+      +`<td class="${r.valence>=0?'apos':'aneg'}">${sgn(r.valence)}</td>`
+      +`<td>${r.salience.toFixed(3)}</td>`
+      +`<td class="${r.dE>=0?'apos':'aneg'}">${d3(r.dE)}</td>`
+      +`<td style="text-align:left">${ebar(r.E)}</td>`
+      +`<td>${r.A.toFixed(2)}</td><td>${r.intensity.toFixed(2)}</td>`
+      +`<td style="text-align:left">${hbar(r.heat)}</td></tr>`;
+  });
+  h+='</tbody>';t.innerHTML=h;
+  const s=d.start,e=d.end;
+  $('batchsum').textContent=`${d.rows.length}턴 · 시작 E ${sgn(s.E)}/열기 ${s.heat.toFixed(2)} → 끝 E ${sgn(e.E)}/열기 ${e.heat.toFixed(2)}`;
+  $('batchcard').style.display='';
+}
+function runBatch(){
+  syncLabels();
+  const n=Math.max(1,Math.min(60,parseInt($('batchn').value)||12));
+  const sel=parseInt($('evt').value);           // 델타 섹션에서 고른 CSV 이벤트가 시작점
+  const start=(!isNaN(sel)&&sel>=0)?sel:0;       // 선택 없음(합성/-1) → 처음(0)부터
+  const evts=Array.from({length:n},(_,i)=>start+i).join(',');
+  const P=new URLSearchParams();
+  P.set('evts',evts);P.set('team',$('team').value);
+  if($('use_fan').checked)P.set('fan',$('fan').value);
+  if($('use_intimacy').checked)P.set('intimacy',$('intimacy').value);
+  if($('use_E').checked)P.set('E',$('E').value);
+  if($('use_A').checked)P.set('A',$('A').value);
+  if($('use_heat').checked)P.set('heat',$('heat').value);
+  setHint('배치 계산 중…');
+  fetch('/api/batch?'+P).then(r=>r.json()).then(d=>{renderBatch(d);setHint('');
+    $('batchcard').scrollIntoView({behavior:'smooth',block:'nearest'});});
+}
+$('batchrun').addEventListener('click',runBatch);
 syncLabels();run();
 </script></html>"""
 
@@ -753,7 +927,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            html = HTML.replace("__KINDS__", json.dumps(KINDS, ensure_ascii=False))
+            html = (HTML.replace("__KINDS__", json.dumps(KINDS, ensure_ascii=False))
+                        .replace("__CHAR__", CFG.name).replace("__ARCH__", CFG.archetype))
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
         elif parsed.path == "/api/events":
             qs = parse_qs(parsed.query)
@@ -763,6 +938,10 @@ class Handler(BaseHTTPRequestHandler):
                        "application/json; charset=utf-8")
         elif parsed.path == "/api/compute":
             data = compute(parse_qs(parsed.query))
+            self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+        elif parsed.path == "/api/batch":
+            data = compute_batch(parse_qs(parsed.query))
             self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
         else:
