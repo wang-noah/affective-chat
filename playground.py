@@ -55,7 +55,7 @@ CSV_PATH = os.path.join(os.path.dirname(__file__), "raw_frame_202606281750.csv")
 
 # 원시 이벤트는 팀 무관하게 저장하고, 관점(team)별 매핑은 요청 때 한다.
 _EVT_KEYS = ("rfc461Schema", "monsterType", "killerTeamID", "victimTeamID", "teamID",
-             "winningTeam", "killer", "bounty", "buildingType", "turretTier",
+             "winningTeam", "killer", "killType", "bounty", "buildingType", "turretTier",
              "gameTime", "sequenceIndex")
 
 
@@ -385,8 +385,9 @@ def compute(q: dict) -> dict:
     # ── 소스층 요약 로그 ──────────────────────────────────────────────────
     def row(on, label, val):
         src.append(f"{'☑' if on else '☐'} {label:<14} {val}")
-    row(text is not None, "유저 발화", f'"{text}" → kind={primary_kind}' if text is not None else "(미입력)")
-    row(has("repeat"), "대화 기록", f"같은 발화 {repeat}회 반복" if has("repeat") else "(미입력→0)")
+    # 비활성(주석처리): 유저 발화 / 대화 기록 소스층 요약 행
+    # row(text is not None, "유저 발화", f'"{text}" → kind={primary_kind}' if text is not None else "(미입력)")
+    # row(has("repeat"), "대화 기록", f"같은 발화 {repeat}회 반복" if has("repeat") else "(미입력→0)")
     if not has("fan"):
         fan_note = "(미입력→0)"
     elif fan_target:   # 팔로우 시 팬심 가산분 반영된 실효 등급 표시
@@ -396,12 +397,13 @@ def compute(q: dict) -> dict:
         fan_note = f"{int(fan)}점 → {fan_grade(fan)} · 팔로우팀 없음→미적용"
     row(has("fan"), "유저 팬심", fan_note)
     row(has("intimacy"), "친밀도", f"{intimacy:.1f}" if has("intimacy") else "(미입력→0)")
-    row(has("onto"), "온톨로지", f'"{onto}" (표시용·미연결)' if has("onto") else "(미입력)")
-    row(game is not None, "실시간 델타", f"{delta_label} → {game} (강도 {gint:.2f})" if game else "(미입력/없음)")
+    # row(has("onto"), "온톨로지", f'"{onto}" (표시용·미연결)' if has("onto") else "(미입력)")   # 온톨로지 토픽 비활성(주석처리)
+    row(game is not None, "온톨로지 실시간데이터", f"{delta_label} → {game} (강도 {gint:.2f})" if game else "(미입력/없음)")
     row(has("following"), "팔로잉", ("팔로우함" if following else "팔로우 안 함") if has("following") else "(미입력→없음)")
-    row(has("heat"), "열기(경기)", f"{heat:.2f}" if has("heat") else "(미입력→0)")
-    row(has("E"), "정서 E", f"{E:+.2f}" if has("E") else "(미입력→0)")
-    row(has("A"), "세기 A", f"{A:.2f}" if has("A") else "(미입력→0.15)")
+    # 비활성(주석처리): 열기 / 정서 E / 세기 A 소스층 요약 행
+    # row(has("heat"), "열기(경기)", f"{heat:.2f}" if has("heat") else "(미입력→0)")
+    # row(has("E"), "정서 E", f"{E:+.2f}" if has("E") else "(미입력→0)")
+    # row(has("A"), "세기 A", f"{A:.2f}" if has("A") else "(미입력→0.15)")
     if goal_fired:
         src.append("→ 목표엔진: 팔로잉없음+(신규 or 팬심낮음) → '팔로우 유도' 자극 생성")
 
@@ -578,13 +580,17 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
 
   <div class=grp>소스층 입력 (노션 7가지)</div>
 
+  <!-- 비활성(주석처리): 유저 발화 + 키워드 자동 분류
   <div class=src><div class=top><input type=checkbox class=use id=use_text checked><label>유저 발화 (대화)</label></div>
     <input type=text id=text value="오늘 회사에서 진짜 짜증났어">
     <div class=sub2><input type=checkbox id=auto checked><label for=auto style="font-weight:400">키워드로 kind 자동 분류</label></div>
     <select id=kind></select></div>
+  -->
 
+  <!-- 비활성(주석처리): 대화 기록 (반복)
   <div class=src><div class=top><input type=checkbox class=use id=use_repeat checked><label>대화 기록 (반복)</label><span class=v id=repeatv></span></div>
     <input type=range id=repeat min=0 max=5 step=1 value=0></div>
+  -->
 
   <div class=src><div class=top><input type=checkbox class=use id=use_fan checked><label>유저 팬심 (누적)</label><span class=v id=fanv></span></div>
     <input type=range id=fan min=0 max=10000 step=100 value=1500></div>
@@ -592,10 +598,12 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   <div class=src><div class=top><input type=checkbox class=use id=use_intimacy checked><label>친밀도</label><span class=v id=iv></span></div>
     <input type=range id=intimacy min=0 max=12 step=.1 value=1></div>
 
+  <!-- 비활성(주석처리): 온톨로지 토픽
   <div class=src><div class=top><input type=checkbox class=use id=use_onto checked><label>온톨로지 토픽</label></div>
     <input type=text id=onto value="롤 e스포츠"></div>
+  -->
 
-  <div class=src><div class=top><input type=checkbox class=use id=use_game checked><label>실시간 델타 (게임)</label><span class=v id=gintv></span></div>
+  <div class=src><div class=top><input type=checkbox class=use id=use_game checked><label>온톨로지 실시간 데이터 (게임)</label></div>
     <div class=sub2>관점 팀
       <select id=team style="width:auto;display:inline-block;margin:0 0 0 6px;padding:3px 6px">
         <option value=100>팀100 (우리)</option>
@@ -603,10 +611,12 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
         <option value=0>팔로우 없음(중립)</option>
       </select></div>
     <select id=evt></select>
+    <!-- 비활성(주석처리): 합성 이벤트 드롭다운 + 합성 강도
     <select id=game></select>
     <div class=sub2><label id=glabel style="flex:none;font-weight:400">합성 강도</label>
       <input type=range id=gint min=0 max=1 step=.05 value=.9 style="margin-top:0"></div>
-    <div class=sub2 id=evtnote>CSV 이벤트 선택 시 합성/강도 무시</div>
+    -->
+    <div class=sub2 id=evtnote>CSV 이벤트에서 선택</div>
     <div class=sub2 style="margin-top:7px;border-top:1px dashed #30363d;padding-top:7px">
       선택 이벤트부터 <input type=number id=batchn min=1 max=60 value=12 style="width:56px;margin:0;padding:3px 5px;display:inline-block"> 개 연속
       <button id=batchrun style="width:auto;margin:0 0 0 auto;padding:4px 10px;background:#8957e5;border-color:#a371f7;color:#fff;font-weight:700">▶ 배치</button></div></div>
@@ -614,14 +624,18 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   <div class=src><div class=top><input type=checkbox class=use id=use_following checked><label>팔로잉</label></div>
     <div class=sub2><input type=checkbox id=following><label for=following style="font-weight:400">팀 팔로우함</label></div></div>
 
+  <!-- 비활성(주석처리): 열기 (경기 heat)
   <div class=src><div class=top><input type=checkbox class=use id=use_heat checked><label>열기 (경기 heat)</label><span class=v id=heatv></span></div>
     <input type=range id=heat min=0 max=1 step=.05 value=0></div>
+  -->
 
+  <!-- 비활성(주석처리): 어펙트 상태값 (E·A)
   <div class=grp>어펙트 상태값 (E·A)</div>
   <div class=src><div class=top><input type=checkbox class=use id=use_E checked><label>정서 E</label><span class=v id=Ev></span></div>
     <input type=range id=E min=-1 max=1 step=.05 value=.1></div>
   <div class=src><div class=top><input type=checkbox class=use id=use_A checked><label>세기 A</label><span class=v id=Av></span></div>
     <input type=range id=A min=0 max=1 step=.05 value=.4></div>
+  -->
 
   <button id=send>▶ SEND — 한 턴 실행</button>
  </div>
@@ -671,18 +685,19 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
 <script>
 const KINDS = __KINDS__;
 const $=id=>document.getElementById(id);
-KINDS.forEach(k=>{const o=document.createElement('option');o.value=o.textContent=k;if(k==='user_distress')o.selected=true;$('kind').appendChild(o)});
-['(없음)','game_positive','game_negative'].forEach(k=>{const o=document.createElement('option');o.value=o.textContent=k;$('game').appendChild(o)});
-// CSV 실시간 델타 이벤트 채우기 (관점 팀에 따라 +/− 라벨이 바뀜)
+// 비활성(주석처리): 유저발화 kind 드롭다운 / 합성 게임 드롭다운 초기화
+// KINDS.forEach(k=>{const o=document.createElement('option');o.value=o.textContent=k;if(k==='user_distress')o.selected=true;$('kind').appendChild(o)});
+// ['(없음)','game_positive','game_negative'].forEach(k=>{const o=document.createElement('option');o.value=o.textContent=k;$('game').appendChild(o)});
+// CSV 온톨로지 실시간 데이터 이벤트 채우기 (관점 팀에 따라 +/− 라벨이 바뀜)
 function loadEvents(){
   const e=$('evt'); const prev=e.value;
   fetch('/api/events?team='+$('team').value).then(r=>r.json()).then(list=>{
     e.innerHTML='';
-    const o0=document.createElement('option');o0.value='-1';o0.textContent='(합성 사용)';e.appendChild(o0);
+    const o0=document.createElement('option');o0.value='-1';o0.textContent='(선택 안 함)';e.appendChild(o0);
     list.forEach((ev,i)=>{const o=document.createElement('option');o.value=i;o.textContent=ev.label+' ['+ev.kind.replace('game_','')+' '+ev.intensity+']';e.appendChild(o)});
     e.value=prev && prev!=='' ? prev : '-1';   // 선택 인덱스 유지
-    $('evtnote').textContent='CSV 이벤트 '+list.length+'개 · 선택 시 합성/강도 무시';
-    syncDeltaMode();
+    $('evtnote').textContent='CSV 이벤트 '+list.length+'개';
+    // syncDeltaMode();   // 합성 컨트롤 비활성(주석처리)
   });
 }
 $('team').addEventListener('change',()=>{loadEvents();dirty();});
@@ -694,29 +709,30 @@ function setHint(m){$('hint').textContent=m;}
 function dirty(){setHint('● 입력 변경됨 — SEND 를 누르세요');}
 
 function syncLabels(){
-  $('Ev').textContent=(+$('E').value).toFixed(2);
-  $('Av').textContent=(+$('A').value).toFixed(2);
-  $('heatv').textContent=(+$('heat').value).toFixed(2);
+  // 비활성(주석처리): E·A·열기·대화기록·합성강도·유저발화 kind 라벨 갱신
+  // $('Ev').textContent=(+$('E').value).toFixed(2);
+  // $('Av').textContent=(+$('A').value).toFixed(2);
+  // $('heatv').textContent=(+$('heat').value).toFixed(2);
   $('iv').textContent=(+$('intimacy').value).toFixed(1);
-  $('repeatv').textContent=$('repeat').value+'회';
+  // $('repeatv').textContent=$('repeat').value+'회';
   $('fanv').textContent=$('fan').value+'점';
-  $('gintv').textContent=(+$('gint').value).toFixed(2);
-  $('kind').disabled=$('auto').checked;
-  syncDeltaMode();
+  // $('gintv').textContent=(+$('gint').value).toFixed(2);
+  // $('kind').disabled=$('auto').checked;
+  // syncDeltaMode();
 }
-// CSV 이벤트가 선택돼 있으면(evt≠-1) 합성 델타·강도는 무시되므로 회색 비활성화
-function syncDeltaMode(){
-  const csv = $('evt').value!=='-1' && $('evt').value!=='';
-  [$('game'),$('gint')].forEach(el=>{el.disabled=csv;el.style.opacity=csv?0.4:1;});
-  $('glabel').style.opacity=csv?0.4:1;
-}
+// 비활성(주석처리): 합성 델타·강도 회색 처리 함수 (합성 컨트롤 제거로 미사용)
+// function syncDeltaMode(){
+//   const csv = $('evt').value!=='-1' && $('evt').value!=='';
+//   [$('game'),$('gint')].forEach(el=>{el.disabled=csv;el.style.opacity=csv?0.4:1;});
+//   $('glabel').style.opacity=csv?0.4:1;
+// }
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 function sgn(n){return (n>=0?'+':'')+n.toFixed(2);}
 // 아비터 구조화 렌더 — 노션 §4(선택 → 값매기기 → 분기/열기) 순서 그대로
 function renderArb(a){
   if(!a)return '';
   let h='';
-  // ① 선택
+  /* 비활성(주석처리): ① 선택 — 누구에게 반응할지 섹션
   h+='<div class=astep><div class=ahd>① 선택 — 누구에게 반응할지<small>select_score = 세기 × 성격가중 × 최신성 × 기분되먹임</small></div>';
   if(!a.candidates.length){h+='<div class=amuted>후보 없음 — 소스층 입력이 비었음</div>';}
   else{
@@ -732,6 +748,7 @@ function renderArb(a){
     h+=`<div class=amuted>선택 정책: ${esc(a.policy.type)} · 임계 ${a.policy.threshold} 이상을 최대 ${a.policy.max}개</div>`;
   }
   h+='</div>';
+  */
   // ② 값매기기
   h+='<div class=astep><div class=ahd>② 값매기기 — 승자 자극에 valence·salience<small>salience = 기본중요도 × 세기 × 부스터 × [팬심배율]</small></div>';
   if(a.fan&&a.fan.factor!==1) h+=`<div class=amuted>팬심 <b>${esc(a.fan.tier_ko)}</b> → 팔로우팀(data) 자극 salience ×${a.fan.factor.toFixed(2)}</div>`;
@@ -825,32 +842,34 @@ function render(d){
   $('aff').innerHTML=renderAff(d.affect_view);
   $('affraw').textContent=d.trace_affect;
   $('affjson').textContent=JSON.stringify(d.affect_output,null,2);
-  if(d.auto&&d.kind_used)$('kind').value=d.kind_used;
+  // if(d.auto&&d.kind_used)$('kind').value=d.kind_used;   // 유저발화 kind 비활성
   lastResult=d.trace_result;
 }
 function run(){
   syncLabels();setHint('계산 중…');
   const P=new URLSearchParams();
-  if($('use_text').checked){P.set('text',$('text').value);P.set('auto',$('auto').checked?'1':'0');P.set('kind',$('kind').value);}
-  if($('use_repeat').checked)P.set('repeat',$('repeat').value);
+  // 비활성(주석처리): 유저발화/대화기록/열기/E·A 전송
+  // if($('use_text').checked){P.set('text',$('text').value);P.set('auto',$('auto').checked?'1':'0');P.set('kind',$('kind').value);}
+  // if($('use_repeat').checked)P.set('repeat',$('repeat').value);
   if($('use_fan').checked)P.set('fan',$('fan').value);
   if($('use_intimacy').checked)P.set('intimacy',$('intimacy').value);
-  if($('use_onto').checked)P.set('onto',$('onto').value);
-  if($('use_game').checked){P.set('game',$('game').value);P.set('gint',$('gint').value);P.set('evt',$('evt').value);P.set('team',$('team').value);}
+  // if($('use_onto').checked)P.set('onto',$('onto').value);   // 온톨로지 토픽 비활성(주석처리)
+  if($('use_game').checked){P.set('evt',$('evt').value);P.set('team',$('team').value);/* 합성 game/gint 비활성 */}
   if($('use_following').checked)P.set('following',$('following').checked?'1':'0');
-  if($('use_heat').checked)P.set('heat',$('heat').value);
-  if($('use_E').checked)P.set('E',$('E').value);
-  if($('use_A').checked)P.set('A',$('A').value);
+  // if($('use_heat').checked)P.set('heat',$('heat').value);
+  // if($('use_E').checked)P.set('E',$('E').value);
+  // if($('use_A').checked)P.set('A',$('A').value);
   fetch('/api/compute?'+P).then(r=>r.json()).then(d=>{render(d);setHint('');});
 }
 // 모든 입력 변경 → 라벨 갱신 + dirty (계산은 SEND 때만)
 document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',()=>{syncLabels();dirty();}));
-$('text').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();run();}});
+// $('text').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();run();}});   // 유저발화 비활성
 $('send').addEventListener('click',run);
-$('applyTurn').addEventListener('click',()=>{if(!lastResult)return;
-  $('use_E').checked=$('use_A').checked=$('use_heat').checked=true;
-  $('E').value=lastResult.E;$('A').value=lastResult.A;$('heat').value=lastResult.heat;
-  syncLabels();setHint('● 결과 상태 적용됨 — SEND 로 다음 턴');});
+// 비활성(주석처리): '이 턴 적용' — E·A·열기 입력이 없어 되먹임 불가
+// $('applyTurn').addEventListener('click',()=>{if(!lastResult)return;
+//   $('use_E').checked=$('use_A').checked=$('use_heat').checked=true;
+//   $('E').value=lastResult.E;$('A').value=lastResult.A;$('heat').value=lastResult.heat;
+//   syncLabels();setHint('● 결과 상태 적용됨 — SEND 로 다음 턴');});
 
 // ── 배치 시뮬레이션: 선택 CSV 이벤트부터 N개를 연속 턴으로 실행 → 표로 누적 변화 ──
 function ebar(v){ // E: -1~+1, 중앙 기준 좌우 바
@@ -895,9 +914,9 @@ function runBatch(){
   P.set('evts',evts);P.set('team',$('team').value);
   if($('use_fan').checked)P.set('fan',$('fan').value);
   if($('use_intimacy').checked)P.set('intimacy',$('intimacy').value);
-  if($('use_E').checked)P.set('E',$('E').value);
-  if($('use_A').checked)P.set('A',$('A').value);
-  if($('use_heat').checked)P.set('heat',$('heat').value);
+  // if($('use_E').checked)P.set('E',$('E').value);      // E·A·열기 입력 비활성(주석처리)
+  // if($('use_A').checked)P.set('A',$('A').value);
+  // if($('use_heat').checked)P.set('heat',$('heat').value);
   setHint('배치 계산 중…');
   fetch('/api/batch?'+P).then(r=>r.json()).then(d=>{renderBatch(d);setHint('');
     $('batchcard').scrollIntoView({behavior:'smooth',block:'nearest'});});
