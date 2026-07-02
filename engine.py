@@ -11,7 +11,8 @@ turn() 흐름:
   5) 표현(항상) + 채팅(route.chat==true 일 때만, 스킵 게이트로 T1/LLM)
 
 캐릭터가 답하면 그 턴 로직 끝. 친밀도·관계 상태를 스스로 올리는 되먹임은 없다
-— 친밀도·팔로잉·팬심은 전부 외부에서 주어지는 입력이다.
+— 친밀도·팬심은 외부에서 주어지는 입력이다. 팔로잉은 팬심의 한 성분으로,
+팀을 팔로우하면 그만큼 팬심이 올라간다(arbiter.effective_fan).
 """
 from __future__ import annotations
 import os
@@ -20,7 +21,7 @@ from typing import Callable, Protocol
 
 from config import PersonalityConfig, load_config
 from affect_engine import AffectState, affect, decay_state
-from arbiter import Candidate, build_request, match_heat_from
+from arbiter import Candidate, build_request, match_heat_from, fan_tier
 from expression import express
 import chat
 
@@ -38,9 +39,13 @@ class Session:
     last_tick: int = 0                     # 마지막 처리 tick (스왑 복귀 시 공백 감쇠용)
 
 
-def goal_engine(session: Session) -> list[Candidate]:
-    """내부 목표 생성 스텁. 신규(친밀도 낮음) + 팔로잉 없음 -> 팔로우 유도."""
-    if session.state.intimacy < 0.5 and not session.following:
+def goal_engine(session: Session, fan: float = 0.0) -> list[Candidate]:
+    """내부 목표 생성 스텁. 팔로잉 없음 + (친밀도 낮음 or 팬심 낮음) -> 팔로우 유도.
+    팔로우하면 팬심이 오르므로(arbiter.effective_fan), 팬심이 낮은(rookie) 유저를
+    팔로우로 유도한다."""
+    if session.following:
+        return []
+    if session.state.intimacy < 0.5 or fan_tier(fan) == "rookie":
         return [Candidate("goal_follow_nudge", intensity=0.5, source="goal", is_goal=True)]
     return []
 
@@ -57,7 +62,7 @@ def speech_primary(winners):
 def turn(session, stimuli, cfg=None, dt=1.0, turn_id="t_0", tick=0, fan=0.0):
     cfg = cfg or session.cfg                 # 세션이 자기 성격을 소유 (없으면 인자로 받음)
     # 2) 후보 풀: 새 자극 + 목표 (Backlog 없음 — 답하면 그 턴 끝)
-    candidates = list(stimuli) + goal_engine(session)
+    candidates = list(stimuli) + goal_engine(session, fan)
     user_spoke = any(c.source == "user" for c in candidates)
 
     # 3) Arbiter: 후보 → AffectRequest (+ winners/losers 는 오케스트레이션용)
