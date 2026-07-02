@@ -158,7 +158,7 @@ def main():
         kind, inten, desc = map_event(p, FOLLOW_TEAM)
         pool = [Candidate(kind, inten, source="delta",
                           payload={"event": desc, "team": f"T{FOLLOW_TEAM}"})]
-        arb_log, _aff, req, output, next_state, winners, av = trace_turn(
+        arb_log, _aff, req, output, next_state, winners, av, _affv = trace_turn(
             state, pool, CFG, turn_id="rt", tick=i, user_spoke=False,
             dt=DT, fan=FAN, fan_target=True)
         expr = express(next_state)
