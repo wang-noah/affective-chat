@@ -22,7 +22,8 @@ from urllib.parse import urlparse, parse_qs
 
 from config import load_config
 from affect_engine import AffectState, affect, _decay_toward
-from arbiter import Candidate, build_request, select_score, affect_mod, map_event, fan_tier
+from arbiter import (Candidate, build_request, select_score, affect_mod, map_event, fan_tier,
+                     APPRAISAL_TABLE, importance_of, booster)
 from expression import express
 from engine import speech_primary
 import chat
@@ -159,20 +160,84 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     if req.state.fan_factor != 1.0:
         arb.append(f"   팬심 {req.state.fan_tier} → 팔로우팀(data) 자극 salience ×{req.state.fan_factor:.2f}")
 
-    def stim_line(tag, st):
+    def stim_line(tag, st, cand):
         if st is None:
             arb.append(f"   {tag}: (없음)")
-        else:
-            arb.append(f"   {tag}: type={st.type:<6} valence={st.valence:+.2f} "
-                       f"salience={st.salience:.3f} src={st.source} tags={st.tags}")
-    stim_line("primary  ", req.primary)
-    stim_line("secondary", req.secondary)
+            return
+        arb.append(f"   {tag}: type={st.type:<6} src={st.source} tags={st.tags}")
+        # valence — 이벤트 종류별 고정 부호값 (표 조회, 변형 없음)
+        arb.append(f"      valence  = {st.valence:+.2f}   ← APPRAISAL 표 '{cand.kind}' 고정값 (변형 없음)")
+        # salience — importance × booster × 팬심배율(data 자극 한정)
+        base_imp = APPRAISAL_TABLE.get(cand.kind, (0.0, 0.3))[1]
+        imp = importance_of(cand)          # = base_imp × 세기
+        bst = booster(cand)                # bounty/멀티킬 부스터
+        ff = req.state.fan_factor if st.type == "data" else 1.0
+        parts = f"importance {imp:.3f} × booster {bst:.2f}"
+        if ff != 1.0:
+            parts += f" × 팬심 ×{ff:.2f}"
+        arb.append(f"      salience = {st.salience:.3f}   = {parts}")
+        arb.append(f"                    └ importance {imp:.3f} = base_imp {base_imp:.2f} × 세기 {cand.intensity:.2f}")
+    stim_line("primary  ", req.primary, winners[0] if winners else None)
+    stim_line("secondary", req.secondary, winners[1] if len(winners) > 1 else None)
     arb.append(f"   path={req.path}   route={req.route}")
     arb.append(f"   deferred_ids={req.deferred_ids}")
     arb.append(f"   state: intimacy={req.state.intimacy:.2f}  match_heat={req.state.match_heat:.2f}  "
                f"팬심={req.state.fan_tier}(×{req.state.fan_factor:.2f})  prev_affect={req.state.prev_affect}")
     arb.append(f"   열기(Arbiter 계산): {state.heat:.2f} → {req.state.heat:.2f}  "
                f"(감쇠 후 경기 data 자극으로 가열)")
+
+    # ── 구조화 뷰 (UI 렌더용) — 노션 Arbiter 문서 §4 기준으로 값 검증 가능하게 ──
+    win_ids = {id(c) for c in winners}
+    cand_rows = []
+    for c in pool:
+        recency = math.exp(-cfg.backlog_decay * c.age)
+        sc = score_by_id[id(c)]
+        if id(c) in win_ids:
+            status = "win"
+        else:
+            status = "defer_thr" if sc < pol.threshold else "defer_rank"
+        cand_rows.append({
+            "kind": c.kind, "intensity": round(c.intensity, 2),
+            "weight": round(cfg.weight(c.kind), 2), "recency": round(recency, 2),
+            "mood": round(affect_mod(c.kind, prev), 2), "score": round(sc, 3),
+            "status": status,
+        })
+
+    def stim_view(slot, st, cand):
+        if st is None or cand is None:
+            return None
+        base_imp = APPRAISAL_TABLE.get(cand.kind, (0.0, 0.3))[1]
+        ff = req.state.fan_factor if st.type == "data" else 1.0
+        return {
+            "slot": slot, "kind": cand.kind, "type": st.type, "source": st.source,
+            "valence": round(st.valence, 3), "salience": round(st.salience, 4),
+            "sal": {"base_imp": round(base_imp, 2), "intensity": round(cand.intensity, 2),
+                    "importance": round(importance_of(cand), 3), "booster": round(booster(cand), 2),
+                    "fan_factor": round(ff, 2), "fan_applies": (st.type == "data" and ff != 1.0)},
+        }
+
+    if req.primary is None:
+        route_reason = "반응할 자극 없음"
+    elif user_spoke:
+        route_reason = "유저가 말을 걸어서 → 말함"
+    elif req.primary.type == "goal":
+        route_reason = "내부 목표(먼저 말 걸기) → 말함"
+    else:
+        op = "≥" if req.route.get("chat") else "<"
+        route_reason = f"주자극 salience {req.primary.salience:.2f} {op} 0.45(발화 임계)"
+
+    arbiter_view = {
+        "policy": {"type": pol.type, "threshold": pol.threshold, "max": pol.max_winners},
+        "candidates": cand_rows,
+        "stimuli": [v for v in (
+            stim_view("primary", req.primary, winners[0] if winners else None),
+            stim_view("secondary", req.secondary, winners[1] if len(winners) > 1 else None)) if v],
+        "fan": {"tier": req.state.fan_tier, "factor": round(req.state.fan_factor, 2),
+                "tier_ko": _FAN_TIER_KO.get(req.state.fan_tier, req.state.fan_tier)},
+        "route": {"chat": bool(req.route.get("chat"))}, "route_reason": route_reason,
+        "path": req.path,
+        "heat": {"prev": round(state.heat, 3), "new": round(req.state.heat, 3)},
+    }
 
     # ── ② Affect: valence·salience 로 E·A 만 적분 (열기는 Arbiter 가 준 값 통과) ──
     new_state, output, _expr = affect(req, state, cfg, dt)
@@ -196,7 +261,7 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     aff.append(f"<span class=res>   결과   E(정서) <b class=hi>{output.E:+.2f}</b>   A(세기) <b class=hi>{output.A:.2f}</b>   "
                f"intensity(종합세기) <b class=hi>{output.intensity:.2f}</b>   "
                f"열기(경기) <b class=hi>{new_state.heat:.2f}</b>(Arbiter)</span>")
-    return "\n".join(arb), "\n".join(aff), req, output, new_state, winners
+    return "\n".join(arb), "\n".join(aff), req, output, new_state, winners, arbiter_view
 
 
 def compute(q: dict) -> dict:
@@ -254,9 +319,9 @@ def compute(q: dict) -> dict:
                               payload=_payload_for(primary_kind, text)))
     if game:
         pool.append(Candidate(game, gint, source="delta", payload=_payload_for(game, "")))
-    # 목표 엔진: 신규(친밀도<0.5) + 팔로잉 없음 → 팔로우 유도
+    # 목표 엔진: 팔로잉 없음 + (친밀도<0.5 or 팬심 낮음=rookie) → 팔로우 유도
     goal_fired = False
-    if intimacy < 0.5 and not following:
+    if not following and (intimacy < 0.5 or fan_tier(fan) == "rookie"):
         pool.append(Candidate("goal_follow_nudge", 0.5, source="goal", is_goal=True))
         goal_fired = True
 
@@ -268,7 +333,7 @@ def compute(q: dict) -> dict:
     fan_target = has("fan") and team != 0
     turn_id = "t_pg"
     tick = int(fv("tick", 0))
-    arbiter_log, affect_log, req, output, next_state, winners = \
+    arbiter_log, affect_log, req, output, next_state, winners, arbiter_view = \
         trace_turn(state, pool, CFG, turn_id, tick, user_spoke, fan=fan, fan_target=fan_target)
     trace_result = {"E": output.E, "A": output.A, "heat": round(next_state.heat, 3)}
 
@@ -306,9 +371,13 @@ def compute(q: dict) -> dict:
         src.append(f"{'☑' if on else '☐'} {label:<14} {val}")
     row(text is not None, "유저 발화", f'"{text}" → kind={primary_kind}' if text is not None else "(미입력)")
     row(has("repeat"), "대화 기록", f"같은 발화 {repeat}회 반복" if has("repeat") else "(미입력→0)")
-    fan_note = (f"{int(fan)}점 → {fan_grade(fan)}"
-                + (f" · 팔로우팀 자극 ×{req.state.fan_factor:.2f}" if fan_target
-                   else " · 팔로우팀 없음→미적용")) if has("fan") else "(미입력→0)"
+    if not has("fan"):
+        fan_note = "(미입력→0)"
+    elif fan_target:   # 팔로우 시 팬심 가산분 반영된 실효 등급 표시
+        fan_note = (f"{int(fan)}점 +팔로우 → {_FAN_TIER_KO[req.state.fan_tier]}"
+                    f" · 팔로우팀 자극 ×{req.state.fan_factor:.2f}")
+    else:
+        fan_note = f"{int(fan)}점 → {fan_grade(fan)} · 팔로우팀 없음→미적용"
     row(has("fan"), "유저 팬심", fan_note)
     row(has("intimacy"), "친밀도", f"{intimacy:.1f}" if has("intimacy") else "(미입력→0)")
     row(has("onto"), "온톨로지", f'"{onto}" (표시용·미연결)' if has("onto") else "(미입력)")
@@ -318,7 +387,7 @@ def compute(q: dict) -> dict:
     row(has("E"), "정서 E", f"{E:+.2f}" if has("E") else "(미입력→0)")
     row(has("A"), "세기 A", f"{A:.2f}" if has("A") else "(미입력→0.15)")
     if goal_fired:
-        src.append("→ 목표엔진: 신규+팔로잉없음 → '팔로우 유도' 자극 생성")
+        src.append("→ 목표엔진: 팔로잉없음+(신규 or 팬심낮음) → '팔로우 유도' 자극 생성")
 
     stage, stage_dir = chat._intimacy_stage(intimacy)
     return {
@@ -329,6 +398,7 @@ def compute(q: dict) -> dict:
         "kind_used": primary_kind or "", "auto": auto,
         "source_log": "\n".join(src),
         "trace_arbiter": arbiter_log, "trace_affect": affect_log,
+        "arbiter_view": arbiter_view,
         "trace_result": trace_result,
     }
 
@@ -377,6 +447,33 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   .dialogue{font-size:19px;font-weight:700;color:#7ee787}
   .mode{float:right;font-size:11px;color:#8b949e;font-weight:400;text-transform:none}
   #hint{font-size:11px;color:#8b949e;margin-top:8px;text-align:center;min-height:14px}
+  /* ── 아비터 구조화 뷰 (노션 §4 기준 값 검증용) ── */
+  .arbview{font-size:12.5px}
+  .astep{margin-bottom:15px}.astep:last-child{margin-bottom:0}
+  .ahd{font-size:11px;font-weight:700;color:#58a6ff;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;border-bottom:1px solid #21262d;padding-bottom:5px}
+  .ahd small{display:block;font-weight:400;text-transform:none;letter-spacing:0;color:#6e7681;font-size:11px;margin-top:3px;font-family:ui-monospace,Menlo,monospace}
+  .atbl{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  .atbl th{font-size:10px;color:#6e7681;font-weight:600;text-align:right;padding:2px 7px;line-height:1.25}
+  .atbl td{text-align:right;padding:4px 7px;border-top:1px solid #21262d;color:#adbac7}
+  .atbl td.akind{text-align:left;color:#e6edf3;font-weight:600}
+  .atbl td.ascore{color:#58a6ff;font-weight:700}
+  .atbl tr.winrow td{background:#1f6feb1a}
+  .apill{font-size:10px;padding:1px 7px;border-radius:999px;background:#21262d;color:#8b949e;white-space:nowrap}
+  .apill.win{background:#238636;color:#fff;font-weight:700}
+  .amuted{color:#6e7681;font-size:11px;margin-top:6px}
+  .astim{background:#0e1116;border:1px solid #21262d;border-radius:8px;padding:10px 12px;margin-top:9px}
+  .astim-h{margin-bottom:7px}
+  .astim-h .atype{font-size:10px;padding:1px 6px;border-radius:4px;background:#21262d;color:#8b949e;margin:0 5px}
+  .astim-h .akind{color:#e6edf3;font-weight:600}
+  .arow{display:flex;align-items:baseline;gap:9px;padding:2px 0}
+  .alab{width:60px;color:#8b949e;font-size:11px;flex:none}
+  .aval{font-variant-numeric:tabular-nums;font-weight:700;min-width:54px;flex:none}
+  .aval.pos{color:#3fb950}.aval.neg{color:#f85149}.aval.sal{color:#58a6ff}
+  .aeq{color:#8b949e;font-size:11px;font-family:ui-monospace,Menlo,monospace}
+  .abadges{display:flex;flex-wrap:wrap;gap:7px}
+  .abadge{font-size:11px;padding:4px 10px;border-radius:6px;background:#0e1116;border:1px solid #21262d;color:#adbac7}
+  .abadge b{color:#e6edf3}
+  .araw{margin-top:13px}.araw summary{cursor:pointer;color:#6e7681;font-size:11px}.araw pre{margin-top:7px}
 </style>
 <div class=wrap>
  <div class=panel>
@@ -441,7 +538,9 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   <div class="card src"><h2>소스층 입력 요약 (이번 SEND)</h2><pre id=srclog></pre></div>
 
   <div class=grid2>
-    <div class="card arb"><h2>① Salience · Arbiter <span style="float:right;font-weight:400;text-transform:none;color:#8b949e">주목</span></h2><pre id=arb></pre></div>
+    <div class="card arb"><h2>① Arbiter — 선별·값매기기 <span style="float:right;font-weight:400;text-transform:none;color:#8b949e">노션 §4 기준</span></h2>
+      <div id=arb class=arbview></div>
+      <details class=araw><summary>원본 트레이스 로그</summary><pre id=arbraw></pre></details></div>
     <div class="card aff"><h2>② Affect Engine <button id=applyTurn style="float:right;width:auto;margin:0;padding:3px 9px;font-size:11px">▶ 이 턴 적용</button></h2><pre id=aff></pre></div>
   </div>
 
@@ -483,6 +582,58 @@ function syncLabels(){
   $('gintv').textContent=(+$('gint').value).toFixed(2);
   $('kind').disabled=$('auto').checked;
 }
+function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function sgn(n){return (n>=0?'+':'')+n.toFixed(2);}
+// 아비터 구조화 렌더 — 노션 §4(선택 → 값매기기 → 분기/열기) 순서 그대로
+function renderArb(a){
+  if(!a)return '';
+  let h='';
+  // ① 선택
+  h+='<div class=astep><div class=ahd>① 선택 — 누구에게 반응할지<small>select_score = 세기 × 성격가중 × 최신성 × 기분되먹임</small></div>';
+  if(!a.candidates.length){h+='<div class=amuted>후보 없음 — 소스층 입력이 비었음</div>';}
+  else{
+    h+='<table class=atbl><thead><tr><th>자극</th><th>세기</th><th>성격<br>가중</th><th>최신성</th><th>기분<br>되먹임</th><th>= 점수</th><th></th></tr></thead><tbody>';
+    a.candidates.forEach(c=>{
+      const pill=c.status==='win'?'<span class="apill win">WIN</span>'
+        :'<span class=apill>'+(c.status==='defer_thr'?'thr 미만':'순위 밀림')+'</span>';
+      h+=`<tr class="${c.status==='win'?'winrow':''}"><td class=akind>${esc(c.kind)}</td>`
+        +`<td>${c.intensity.toFixed(2)}</td><td>${c.weight.toFixed(2)}</td><td>${c.recency.toFixed(2)}</td>`
+        +`<td>${c.mood.toFixed(2)}</td><td class=ascore>${c.score.toFixed(3)}</td><td>${pill}</td></tr>`;
+    });
+    h+='</tbody></table>';
+    h+=`<div class=amuted>선택 정책: ${esc(a.policy.type)} · 임계 ${a.policy.threshold} 이상을 최대 ${a.policy.max}개</div>`;
+  }
+  h+='</div>';
+  // ② 값매기기
+  h+='<div class=astep><div class=ahd>② 값매기기 — 승자 자극에 valence·salience<small>salience = 기본중요도 × 세기 × 부스터 × [팬심배율]</small></div>';
+  if(a.fan&&a.fan.factor!==1) h+=`<div class=amuted>팬심 <b>${esc(a.fan.tier_ko)}</b> → 팔로우팀(data) 자극 salience ×${a.fan.factor.toFixed(2)}</div>`;
+  if(!a.stimuli.length){h+='<div class=amuted>승자 자극 없음</div>';}
+  a.stimuli.forEach(s=>{
+    const b=s.sal;
+    h+='<div class=astim>';
+    h+=`<div class=astim-h><b>${s.slot==='primary'?'주자극':'보조자극'}</b>`
+      +`<span class=atype>${esc(s.type)}</span><span class=akind>${esc(s.kind)}</span>`
+      +`<span class=amuted style="margin-left:6px">src=${esc(s.source)}</span></div>`;
+    const vcls=s.valence>=0?'pos':'neg';
+    h+=`<div class=arow><span class=alab>valence</span>`
+      +`<span class="aval ${vcls}">${sgn(s.valence)}</span>`
+      +`<span class=aeq>← 표 '${esc(s.kind)}' 고정값 (변형 없음)</span></div>`;
+    let eq=`기본중요도 ${b.base_imp.toFixed(2)} × 세기 ${b.intensity.toFixed(2)} × 부스터 ${b.booster.toFixed(2)}`;
+    if(b.fan_applies) eq+=` × 팬심 ×${b.fan_factor.toFixed(2)}`;
+    h+=`<div class=arow><span class=alab>salience</span>`
+      +`<span class="aval sal">${s.salience.toFixed(3)}</span><span class=aeq>= ${eq}</span></div>`;
+    h+='</div>';
+  });
+  h+='</div>';
+  // ③ 분기 · 열기
+  h+='<div class=astep><div class=ahd>③ 분기 · 열기</div><div class=abadges>';
+  h+=`<span class=abadge>말하기(chat): <b>${a.route.chat?'예':'아니오'}</b></span>`;
+  h+=`<span class=abadge>${esc(a.route_reason)}</span>`;
+  h+=`<span class=abadge>표현 모드: <b>${esc(a.path)}</b></span>`;
+  h+=`<span class=abadge>열기: ${a.heat.prev.toFixed(2)} → <b>${a.heat.new.toFixed(2)}</b></span>`;
+  h+='</div></div>';
+  return h;
+}
 function render(d){
   $('face').textContent=d.face;
   $('b_tone').textContent='톤 · '+d.tone;
@@ -492,7 +643,9 @@ function render(d){
   $('dots').textContent='●'.repeat(d.particles);$('dots').style.color=COLOR[d.effect_color];
   $('stage').innerHTML='친밀도 단계: '+d.stage+'<small>'+d.stage_dir+'</small>';
   $('srclog').textContent=d.source_log;
-  $('arb').textContent=d.trace_arbiter;$('aff').innerHTML=d.trace_affect;
+  $('arb').innerHTML=renderArb(d.arbiter_view);
+  $('arbraw').textContent=d.trace_arbiter;
+  $('aff').innerHTML=d.trace_affect;
   $('affjson').textContent=JSON.stringify(d.affect_output,null,2);
   if(d.auto&&d.kind_used)$('kind').value=d.kind_used;
   lastResult=d.trace_result;
