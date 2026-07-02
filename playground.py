@@ -181,19 +181,21 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     E0 = _decay_toward(base_E, cfg.valence_bias, cfg.decay_E, dt)
     A0 = _decay_toward(base_A, 0.15, cfg.decay_A, dt)
     aff = ["decay (prev_affect 가 기저로 식음)",
-           f"   E {base_E:+.2f}→{E0:+.2f}   A {base_A:.2f}→{A0:.2f}",
+           f"   E(정서) {base_E:+.2f}→<b class=q>{E0:+.2f}</b>   A(세기) {base_A:.2f}→<b class=q>{A0:.2f}</b>",
            "", "integrate (valence·salience 는 Arbiter 가 준 값 → 곱해서 E·A 갱신)"]
     for st in (req.primary, req.secondary):
         if st is None:
             continue
         dE = st.valence * st.salience * cfg.reactivity
         dA = st.salience * cfg.arousal_gain
-        aff.append(f"   {st.type:<8} valence {st.valence:+.2f}(arbiter) × salience {st.salience:.3f}(arbiter) "
-                   f"→ dE {dE:+.3f}, dA {dA:+.3f}")
+        aff.append(f"   {st.type:<8} valence <b class=v>{st.valence:+.2f}</b>(arbiter) × "
+                   f"salience <b class=v>{st.salience:.3f}</b>(arbiter) "
+                   f"→ dE <b class=q>{dE:+.3f}</b>, dA <b class=q>{dA:+.3f}</b>")
     if req.primary is None:
         aff.append("   (반응할 자극 없음)")
-    aff.append(f"   결과   E {output.E:+.2f}   A {output.A:.2f}   "
-               f"intensity {output.intensity:.2f}   열기 {new_state.heat:.2f}(Arbiter)")
+    aff.append(f"<span class=res>   결과   E(정서) <b class=hi>{output.E:+.2f}</b>   A(세기) <b class=hi>{output.A:.2f}</b>   "
+               f"intensity(종합세기) <b class=hi>{output.intensity:.2f}</b>   "
+               f"열기(경기) <b class=hi>{new_state.heat:.2f}</b>(Arbiter)</span>")
     return "\n".join(arb), "\n".join(aff), req, output, new_state, winners
 
 
@@ -366,6 +368,11 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   .card.arb h2{color:#58a6ff}.card.aff h2{color:#d2a8ff}.card.src h2{color:#3fb950}
   pre{margin:0;white-space:pre-wrap;font:12.5px/1.6 ui-monospace,Menlo,monospace;color:#adbac7}
   pre.affjson{color:#7ee787}
+  /* affect 로그 강조: v=Arbiter가 준 입력(파랑) · q=Affect가 계산한 값(보라) · hi/res=최종 결과 */
+  pre#aff .v{color:#58a6ff;font-weight:700}
+  pre#aff .q{color:#d2a8ff;font-weight:700}
+  pre#aff .hi{color:#fff;font-weight:700}
+  pre#aff .res{background:#d2a8ff1f;border-left:3px solid #d2a8ff;border-radius:4px}
   .user{color:#8b949e;font-size:13px;margin-bottom:6px}
   .dialogue{font-size:19px;font-weight:700;color:#7ee787}
   .mode{float:right;font-size:11px;color:#8b949e;font-weight:400;text-transform:none}
@@ -485,7 +492,7 @@ function render(d){
   $('dots').textContent='●'.repeat(d.particles);$('dots').style.color=COLOR[d.effect_color];
   $('stage').innerHTML='친밀도 단계: '+d.stage+'<small>'+d.stage_dir+'</small>';
   $('srclog').textContent=d.source_log;
-  $('arb').textContent=d.trace_arbiter;$('aff').textContent=d.trace_affect;
+  $('arb').textContent=d.trace_arbiter;$('aff').innerHTML=d.trace_affect;
   $('affjson').textContent=JSON.stringify(d.affect_output,null,2);
   if(d.auto&&d.kind_used)$('kind').value=d.kind_used;
   lastResult=d.trace_result;
