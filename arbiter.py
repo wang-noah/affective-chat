@@ -156,9 +156,19 @@ def appraisal_salience(c: Candidate) -> float:
 #   자극(data)'의 salience(주목도)만 키운다 → 광팬일수록 우리 팀 이벤트에 더
 #   크게 반응(좋을 땐 더 기쁘게, 나쁠 땐 더 속상하게). 선택 순위(select_score)
 #   에는 관여하지 않는다.
+#
+#   팔로잉은 팬심과 별개 축이 아니라 팬심의 한 성분이다: 팀을 팔로우하면
+#   그 자체로 팬심이 올라간다(FOLLOW_FAN_BONUS 만큼 가산). 팔로우만 해도
+#   최소 follower(동행 팬) 등급에서 시작하고, 누적 Fan심이 그 위에 쌓인다.
 # ===========================================================================
 FAN_TIERS = [(8000, "die_hard"), (4000, "core"), (1500, "devoted"), (500, "follower")]
 FAN_FACTOR = {"rookie": 1.0, "follower": 1.15, "devoted": 1.30, "core": 1.50, "die_hard": 1.80}
+FOLLOW_FAN_BONUS = 500.0   # 팔로우 시 팬심 가산분 = follower 임계값 (팔로우만 해도 동행 팬)
+
+
+def effective_fan(cumulative: float, following: bool) -> float:
+    """실효 팬심 = 누적 Fan심 + (팔로우 시 가산분). 팔로잉을 팬심에 흡수한다."""
+    return cumulative + (FOLLOW_FAN_BONUS if following else 0.0)
 
 
 def fan_tier(cumulative: float) -> str:
@@ -302,7 +312,7 @@ def build_request(
     user_spoke: bool,
     match_heat: float | None = None,
     fan: float = 0.0,               # 누적 Fan심 (유저↔팔로우팀)
-    fan_target: bool = True,        # 팔로우팀이 있는가 (없으면 팬심 배율 무효)
+    fan_target: bool = True,        # 팔로우팀이 있는가 (=팔로잉; 팬심 가산+배율 대상)
     prev_heat: float = 0.0,         # 직전 열기 (감쇠 기준)
     dt: float = 1.0,                # 열기 감쇠용 시간 간격
     seed: int | None = None,
@@ -314,8 +324,9 @@ def build_request(
             "warmth": min(1.0, max(0.0, intimacy / 6.0))}  # 친밀도→친밀감(절친 6≈1.0)
     winners, losers = select(candidates, prev, cfg)
 
-    tier = fan_tier(fan)
-    ffac = fan_factor(fan) if fan_target else 1.0   # 팔로우팀 없으면 증폭 안 함
+    eff_fan = effective_fan(fan, fan_target)        # 팔로잉이 팬심을 끌어올림
+    tier = fan_tier(eff_fan)
+    ffac = fan_factor(eff_fan) if fan_target else 1.0   # 팔로우팀 없으면 증폭 안 함
     primary = _to_stim(winners[0], cfg, ffac) if winners else None
     secondary = _to_stim(winners[1], cfg, ffac) if len(winners) > 1 else None
 
