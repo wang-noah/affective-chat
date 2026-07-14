@@ -26,7 +26,7 @@ from arbiter import (Candidate, build_request, select_score, affect_mod, map_eve
                      APPRAISAL_TABLE, importance_of, booster)
 from expression import express
 from engine import speech_primary
-from understanding import understand
+from understanding import understand, warmup_embed
 import chat
 
 CFG = load_config(os.path.join(os.path.dirname(__file__), "character.json"))
@@ -417,6 +417,7 @@ def compute(q: dict) -> dict:
             "text": u.text, "phase": u.phase, "segment": u.segment,
             "intent": u.intent, "confidence": u.confidence,
             "needs_new_context": u.needs_new_context,
+            "intent_source": u.intent_source,
         }
     else:
         understanding_view = None
@@ -537,6 +538,10 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   .uval{color:#e6edf3;font-variant-numeric:tabular-nums}
   .uval.big{font-size:22px;font-weight:800;color:#f0883e}
   .umuted{color:#6e7681;font-size:11px}
+  .usrc{font-size:10px;padding:2px 8px;border-radius:999px;font-weight:700;letter-spacing:.03em}
+  .usrc.rule{background:#2ea04333;color:#3fb950;border:1px solid #2ea04355}
+  .usrc.embed{background:#8957e533;color:#d2a8ff;border:1px solid #a371f755}
+  .usrc.none{background:#6e768133;color:#8b949e;border:1px solid #6e768155}
   .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin:0 0 9px}
   .card.arb h2{color:#58a6ff}.card.aff h2{color:#d2a8ff}.card.src h2{color:#3fb950}
   pre{margin:0;white-space:pre-wrap;font:12.5px/1.6 ui-monospace,Menlo,monospace;color:#adbac7}
@@ -686,7 +691,7 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   <div class="card understand"><h2>요청이해 (Understanding) <span style="float:right;font-weight:400;text-transform:none;color:#8b949e">노션 plan §2</span></h2>
     <div class=uview>
       <div class=urow><span class=ulab>원문</span><span class=uval id=u_text>—</span></div>
-      <div class=urow><span class=ulab>intent</span><span class="uval big" id=u_intent>none</span><span class=umuted id=u_intent_conf></span></div>
+      <div class=urow><span class=ulab>intent</span><span class="uval big" id=u_intent>none</span><span class="usrc" id=u_intent_src></span><span class=umuted id=u_intent_conf></span></div>
       <div class=urow><span class=ulab>segment</span><span class=uval id=u_seg>—</span><span class=umuted id=u_seg_conf></span></div>
       <div class=urow><span class=ulab>phase</span><span class=uval id=u_phase>—</span><span class=umuted>서버 주입값 (텍스트 추론 안 함)</span></div>
       <div class=urow><span class=ulab>needs_new_context</span><span class=uval id=u_nnc>—</span></div>
@@ -869,7 +874,12 @@ function render(d){
     $('u_text').textContent=u.text;
     $('u_intent').textContent=u.intent||'none';
     $('u_intent').style.color=u.intent?'#f0883e':'#6e7681';
-    $('u_intent_conf').textContent='confidence '+u.confidence.intent.toFixed(2);
+    const src=u.intent_source||'none';
+    const label={rule:'RULE',embed:'EMBED (e5-small)',none:'—'}[src];
+    $('u_intent_src').textContent=label;
+    $('u_intent_src').className='usrc '+src;
+    const cosNote=(u.confidence.embed_cos!==undefined)?' · cos '+u.confidence.embed_cos.toFixed(3):'';
+    $('u_intent_conf').textContent='confidence '+u.confidence.intent.toFixed(2)+cosNote;
     $('u_seg').textContent=u.segment;
     $('u_seg_conf').textContent='confidence '+u.confidence.segment.toFixed(2);
     $('u_phase').textContent=u.phase;
@@ -879,6 +889,7 @@ function render(d){
     ['u_text','u_intent','u_seg','u_phase','u_nnc'].forEach(id=>$(id).textContent='—');
     $('u_intent').style.color='#6e7681';
     $('u_intent_conf').textContent='';$('u_seg_conf').textContent='';
+    $('u_intent_src').textContent='';$('u_intent_src').className='usrc';
     $('u_nnc').style.color='';
   }
   $('arb').innerHTML=renderArb(d.arbiter_view);
@@ -1010,6 +1021,9 @@ if __name__ == "__main__":
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"▶ 소스층 컨트롤 패널: http://localhost:{port}  (Ctrl+C 종료)")
     print(f"  캐릭터: {CFG.name} ({CFG.archetype}) · 실시간 델타 이벤트 {len(EVENTS_RAW)}개 로드")
+    # 요청이해 임베딩 폴백 프리로드 — 첫 요청 스톨 방지 (미설치 시 자동 스킵)
+    print("  요청이해 임베딩(e5-small) 로드…", end="", flush=True)
+    print(" ok" if warmup_embed() else " 스킵 (rule-only 모드)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

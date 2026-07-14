@@ -1,3 +1,8 @@
 # 데모(python3 engine.py)는 표준 라이브러리만으로 동작 — 설치 불필요.
 # 아래는 라이브 LLM 호출(chat.call_haiku)을 쓸 때만 필요.
 requests>=2.31
+
+# 요청이해 층 임베딩 폴백 — 룰이 놓친 오타/유의어 발화 잡기.
+# 미설치 시 rule-only 로 자동 다운그레이드 (playground 는 정상 동작).
+# multilingual-e5-small 118MB 모델 + torch (~200MB) 다운로드 필요.
+sentence-transformers>=2.7
