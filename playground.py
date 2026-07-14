@@ -26,6 +26,7 @@ from arbiter import (Candidate, build_request, select_score, affect_mod, map_eve
                      APPRAISAL_TABLE, importance_of, booster)
 from expression import express
 from engine import speech_primary
+from understanding import understand
 import chat
 
 CFG = load_config(os.path.join(os.path.dirname(__file__), "character.json"))
@@ -385,8 +386,8 @@ def compute(q: dict) -> dict:
     # ── 소스층 요약 로그 ──────────────────────────────────────────────────
     def row(on, label, val):
         src.append(f"{'☑' if on else '☐'} {label:<14} {val}")
-    # 비활성(주석처리): 유저 발화 / 대화 기록 소스층 요약 행
-    # row(text is not None, "유저 발화", f'"{text}" → kind={primary_kind}' if text is not None else "(미입력)")
+    row(text is not None, "유저 발화", f'"{text}"' if text is not None else "(미입력)")
+    # 비활성(주석처리): 대화 기록 (반복)
     # row(has("repeat"), "대화 기록", f"같은 발화 {repeat}회 반복" if has("repeat") else "(미입력→0)")
     if not has("fan"):
         fan_note = "(미입력→0)"
@@ -408,6 +409,18 @@ def compute(q: dict) -> dict:
         src.append("→ 목표엔진: 팔로잉없음+(신규 or 팬심낮음) → '팔로우 유도' 자극 생성")
 
     stage, stage_dir = chat._intimacy_stage(intimacy)
+
+    # ── 요청이해 (Understanding) — 노션 plan §2 룰. text 있을 때만 추출 ──────
+    if text:
+        u = understand(text)
+        understanding_view = {
+            "text": u.text, "phase": u.phase, "segment": u.segment,
+            "intent": u.intent, "confidence": u.confidence,
+            "needs_new_context": u.needs_new_context,
+        }
+    else:
+        understanding_view = None
+
     return {
         "face": expr.face, "energy": expr.energy, "tone": expr.tone,
         "effect_color": expr.effect_color, "particles": expr.particles,
@@ -418,6 +431,7 @@ def compute(q: dict) -> dict:
         "trace_arbiter": arbiter_log, "trace_affect": affect_log,
         "arbiter_view": arbiter_view, "affect_view": affect_view,
         "trace_result": trace_result,
+        "understanding": understanding_view,
     }
 
 
@@ -516,6 +530,13 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:1100px){.grid2{grid-template-columns:1fr}}
   .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:15px;margin-top:0}
   .card.arb{border-color:#1f6feb55}.card.aff{border-color:#d2a8ff55}.card.src{border-color:#2ea04355}
+  .card.understand{border-color:#f0883e55}.card.understand h2{color:#f0883e}
+  .uview{display:flex;flex-direction:column;gap:9px}
+  .urow{display:flex;align-items:baseline;gap:12px}
+  .ulab{width:150px;color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.05em;flex:none}
+  .uval{color:#e6edf3;font-variant-numeric:tabular-nums}
+  .uval.big{font-size:22px;font-weight:800;color:#f0883e}
+  .umuted{color:#6e7681;font-size:11px}
   .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin:0 0 9px}
   .card.arb h2{color:#58a6ff}.card.aff h2{color:#d2a8ff}.card.src h2{color:#3fb950}
   pre{margin:0;white-space:pre-wrap;font:12.5px/1.6 ui-monospace,Menlo,monospace;color:#adbac7}
@@ -580,12 +601,8 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
 
   <div class=grp>소스층 입력 (노션 7가지)</div>
 
-  <!-- 비활성(주석처리): 유저 발화 + 키워드 자동 분류
   <div class=src><div class=top><input type=checkbox class=use id=use_text checked><label>유저 발화 (대화)</label></div>
-    <input type=text id=text value="오늘 회사에서 진짜 짜증났어">
-    <div class=sub2><input type=checkbox id=auto checked><label for=auto style="font-weight:400">키워드로 kind 자동 분류</label></div>
-    <select id=kind></select></div>
-  -->
+    <input type=text id=text value="이 챔프 강해?" placeholder="예: 이 챔프 강해? / 이 패치에 1픽 승률 어때?"></div>
 
   <!-- 비활성(주석처리): 대화 기록 (반복)
   <div class=src><div class=top><input type=checkbox class=use id=use_repeat checked><label>대화 기록 (반복)</label><span class=v id=repeatv></span></div>
@@ -665,6 +682,15 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   </div>
 
   <div class="card src"><h2>소스층 입력 요약 (이번 SEND)</h2><pre id=srclog></pre></div>
+
+  <div class="card understand"><h2>요청이해 (Understanding) <span style="float:right;font-weight:400;text-transform:none;color:#8b949e">노션 plan §2</span></h2>
+    <div class=uview>
+      <div class=urow><span class=ulab>원문</span><span class=uval id=u_text>—</span></div>
+      <div class=urow><span class=ulab>intent</span><span class="uval big" id=u_intent>none</span><span class=umuted id=u_intent_conf></span></div>
+      <div class=urow><span class=ulab>segment</span><span class=uval id=u_seg>—</span><span class=umuted id=u_seg_conf></span></div>
+      <div class=urow><span class=ulab>phase</span><span class=uval id=u_phase>—</span><span class=umuted>서버 주입값 (텍스트 추론 안 함)</span></div>
+      <div class=urow><span class=ulab>needs_new_context</span><span class=uval id=u_nnc>—</span></div>
+    </div></div>
 
   <div class=grid2>
     <div class="card arb"><h2>① Arbiter — 선별·값매기기 <span style="float:right;font-weight:400;text-transform:none;color:#8b949e">노션 §4 기준</span></h2>
@@ -837,6 +863,24 @@ function render(d){
   $('kpi_heat').textContent=o.heat.toFixed(2);$('kpi_heat').style.color=o.heat>0.66?'#f0883e':'#e6edf3';
   $('kpi_heats').textContent=o.heat>0.66?'🔥 뜨거움':'Arbiter 계산';
   $('srclog').textContent=d.source_log;
+  // 요청이해 — intent 값을 크게, 나머지 축은 보조로. text 없으면 전부 '—' 로.
+  const u=d.understanding;
+  if(u){
+    $('u_text').textContent=u.text;
+    $('u_intent').textContent=u.intent||'none';
+    $('u_intent').style.color=u.intent?'#f0883e':'#6e7681';
+    $('u_intent_conf').textContent='confidence '+u.confidence.intent.toFixed(2);
+    $('u_seg').textContent=u.segment;
+    $('u_seg_conf').textContent='confidence '+u.confidence.segment.toFixed(2);
+    $('u_phase').textContent=u.phase;
+    $('u_nnc').textContent=u.needs_new_context?'true (다음 레이어 재확인 필요)':'false';
+    $('u_nnc').style.color=u.needs_new_context?'#f85149':'#3fb950';
+  }else{
+    ['u_text','u_intent','u_seg','u_phase','u_nnc'].forEach(id=>$(id).textContent='—');
+    $('u_intent').style.color='#6e7681';
+    $('u_intent_conf').textContent='';$('u_seg_conf').textContent='';
+    $('u_nnc').style.color='';
+  }
   $('arb').innerHTML=renderArb(d.arbiter_view);
   $('arbraw').textContent=d.trace_arbiter;
   $('aff').innerHTML=renderAff(d.affect_view);
@@ -848,8 +892,8 @@ function render(d){
 function run(){
   syncLabels();setHint('계산 중…');
   const P=new URLSearchParams();
-  // 비활성(주석처리): 유저발화/대화기록/열기/E·A 전송
-  // if($('use_text').checked){P.set('text',$('text').value);P.set('auto',$('auto').checked?'1':'0');P.set('kind',$('kind').value);}
+  if($('use_text').checked&&$('text').value.trim())P.set('text',$('text').value);
+  // 비활성(주석처리): 대화기록/열기/E·A 전송 (kind/auto 는 요청이해 층 도입으로 제거)
   // if($('use_repeat').checked)P.set('repeat',$('repeat').value);
   if($('use_fan').checked)P.set('fan',$('fan').value);
   if($('use_intimacy').checked)P.set('intimacy',$('intimacy').value);
@@ -863,7 +907,7 @@ function run(){
 }
 // 모든 입력 변경 → 라벨 갱신 + dirty (계산은 SEND 때만)
 document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',()=>{syncLabels();dirty();}));
-// $('text').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();run();}});   // 유저발화 비활성
+$('text').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();run();}});
 $('send').addEventListener('click',run);
 // 비활성(주석처리): '이 턴 적용' — E·A·열기 입력이 없어 되먹임 불가
 // $('applyTurn').addEventListener('click',()=>{if(!lastResult)return;
