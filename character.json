@@ -13,11 +13,15 @@
     "backlog_decay": 0.4
   },
   "attention": {
-    "greeting": 0.90,
-    "smalltalk": 0.70,
-    "user_distress": 0.85,
-    "compliment": 0.60,
-    "insult": 0.50,
+    "excitement": 0.85,
+    "surprise": 0.80,
+    "joy": 0.75,
+    "anger": 0.85,
+    "sadness": 0.85,
+    "disappointment": 0.70,
+    "irritation": 0.65,
+    "confusion": 0.60,
+    "neutral": 0.55,
     "game_positive": 0.40,
     "game_negative": 0.40,
     "goal_follow_nudge": 0.55

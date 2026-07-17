@@ -1,0 +1,128 @@
+{
+  "_note": "LCK 팀·선수 별칭 목업 (대략 2024 시즌 기준). 로스터·별칭은 data owner 가 시즌·이적마다 갱신. 노션 감성태깅 §5·§8 확장 루프.",
+  "_schema": "teams[canonical].{aliases,players} + players[canonical].{aliases}. fan_tagger.py 가 두 축을 각각 ENTITY_DICT·TEAM_ROSTER 로 뽑아 씀.",
+  "_case_sensitive_aliases_note": "일반 영어 단어·LoL 아이템명과 겹치는 별칭은 원 대소문자 그대로만 매칭 (예: 'perfect' 는 'PerfecT' 로 오탐되면 안 됨). 한국어 별칭은 여기 안 넣어도 됨 (대소문자 개념 없음).",
+  "_case_sensitive_aliases": [
+    "BRO",
+    "PerfecT",
+    "Deft",
+    "Effort",
+    "Peanut",
+    "Rascal",
+    "Way",
+    "Prince",
+    "Aiming",
+    "Doran",
+    "Kingen",
+    "Karis",
+    "Cuzz",
+    "Clear",
+    "Hena",
+    "Fate",
+    "Sponge",
+    "Sylvie",
+    "Belial"
+  ],
+  "teams": {
+    "T1": {
+      "aliases": ["T1", "티원", "티식스", "SKT", "SKT T1"],
+      "players": ["Faker", "Zeus", "Oner", "Gumayusi", "Keria"]
+    },
+    "Gen.G": {
+      "aliases": ["Gen.G", "GenG", "GENG", "젠지", "지지"],
+      "players": ["Kiin", "Canyon", "Chovy", "Peyz", "Lehends"]
+    },
+    "HLE": {
+      "aliases": ["HLE", "한화", "한화생명", "한생", "생명", "Hanwha Life", "한화생명e스포츠"],
+      "players": ["Doran", "Peanut", "Zeka", "Viper", "Delight"]
+    },
+    "DK": {
+      "aliases": ["DK", "담원", "담원기아", "디플러스", "디플러스기아", "디플기아", "Dplus KIA"],
+      "players": ["Kingen", "Lucid", "ShowMaker", "Aiming", "Kellin"]
+    },
+    "KT": {
+      "aliases": ["KT", "케이티", "롤스터", "KT롤스터", "KT Rolster", "케이티 롤스터"],
+      "players": ["PerfecT", "Cuzz", "Bdd", "Deft", "Way"]
+    },
+    "DRX": {
+      "aliases": ["DRX", "디알엑스"],
+      "players": ["Rascal", "Sponge", "FATE", "Teddy", "Belial"]
+    },
+    "KDF": {
+      "aliases": ["KDF", "광동", "광동프릭스", "프릭스", "Kwangdong Freecs", "광동 프릭스"],
+      "players": ["DuDu", "YoungJae", "BuLLDoG", "Taeyoon", "Andil"]
+    },
+    "NS": {
+      "aliases": ["NS", "농심", "농심레드포스", "레드포스", "Nongshim RedForce", "농심 레드포스"],
+      "players": ["DnDn", "Sylvie", "FIESTA", "Jiwoo", "Peter"]
+    },
+    "BFX": {
+      "aliases": ["BFX", "BNK", "피어엑스", "피어X", "BNK FearX", "BNK 피어엑스"],
+      "players": ["Clear", "Raptor", "Diable", "Pollu"]
+    },
+    "BRO": {
+      "aliases": ["BRO", "브리온", "OK브리온", "OKBRO", "OK BRION"],
+      "players": ["Morgan", "Karis", "Hena", "Effort", "Prince"]
+    }
+  },
+  "players": {
+    "Faker":     {"aliases": ["Faker", "페이커", "이상혁", "대마왕"]},
+    "Zeus":      {"aliases": ["Zeus", "제우스", "최우제"]},
+    "Oner":      {"aliases": ["Oner", "오너", "문현준"]},
+    "Gumayusi":  {"aliases": ["Gumayusi", "구마유시", "구마", "이민형"]},
+    "Keria":     {"aliases": ["Keria", "케리아", "류민석"]},
+
+    "Kiin":      {"aliases": ["Kiin", "킹인", "김기인"]},
+    "Canyon":    {"aliases": ["Canyon", "캐년", "캐니언", "김건부"]},
+    "Chovy":     {"aliases": ["Chovy", "쵸비", "정지훈"]},
+    "Peyz":      {"aliases": ["Peyz", "페이즈", "김수환"]},
+    "Lehends":   {"aliases": ["Lehends", "리헨즈", "손시우"]},
+
+    "Doran":     {"aliases": ["Doran", "도란", "최현준"]},
+    "Peanut":    {"aliases": ["Peanut", "피넛", "한왕호"]},
+    "Zeka":      {"aliases": ["Zeka", "제카", "김건우"]},
+    "Viper":     {"aliases": ["Viper", "바이퍼", "박도현"]},
+    "Delight":   {"aliases": ["Delight", "딜라이트", "유환중"]},
+
+    "Kingen":    {"aliases": ["Kingen", "킹겐", "황성훈"]},
+    "Lucid":     {"aliases": ["Lucid", "루시드", "박정민"]},
+    "ShowMaker": {"aliases": ["ShowMaker", "쇼메이커", "쇼메", "허수"]},
+    "Aiming":    {"aliases": ["Aiming", "에이밍", "김하람"]},
+    "Kellin":    {"aliases": ["Kellin", "켈린", "김형규"]},
+
+    "PerfecT":   {"aliases": ["PerfecT", "퍼펙트"]},
+    "Cuzz":      {"aliases": ["Cuzz", "커즈", "문우찬"]},
+    "Bdd":       {"aliases": ["Bdd", "비디디", "곽보성"]},
+    "Deft":      {"aliases": ["Deft", "데프트", "김혁규"]},
+    "Way":       {"aliases": ["Way", "웨이", "조용인"]},
+
+    "Rascal":    {"aliases": ["Rascal", "라스칼", "김광희"]},
+    "Sponge":    {"aliases": ["Sponge", "스펀지"]},
+    "FATE":      {"aliases": ["FATE", "페이트", "유수혁"]},
+    "Teddy":     {"aliases": ["Teddy", "테디", "박진성"]},
+    "Belial":    {"aliases": ["Belial", "벨리알"]},
+
+    "DuDu":      {"aliases": ["DuDu", "두두"]},
+    "YoungJae":  {"aliases": ["YoungJae", "영재"]},
+    "BuLLDoG":   {"aliases": ["BuLLDoG", "불도그"]},
+    "Taeyoon":   {"aliases": ["Taeyoon", "태윤"]},
+    "Andil":     {"aliases": ["Andil", "앤딜"]},
+
+    "DnDn":      {"aliases": ["DnDn", "던던"]},
+    "Sylvie":    {"aliases": ["Sylvie", "실비"]},
+    "FIESTA":    {"aliases": ["FIESTA", "피에스타"]},
+    "Jiwoo":     {"aliases": ["Jiwoo", "지우"]},
+    "Peter":     {"aliases": ["Peter", "피터"]},
+
+    "Clear":     {"aliases": ["Clear", "클리어"]},
+    "Raptor":    {"aliases": ["Raptor", "랩터"]},
+    "Diable":    {"aliases": ["Diable", "디아블"]},
+    "Pollu":     {"aliases": ["Pollu", "폴루"]},
+
+    "Morgan":    {"aliases": ["Morgan", "모건"]},
+    "Karis":     {"aliases": ["Karis", "카리스"]},
+    "Hena":      {"aliases": ["Hena", "헤나"]},
+    "Effort":    {"aliases": ["Effort", "에포트", "이상호"]},
+    "Prince":    {"aliases": ["Prince", "프린스", "이채환"]}
+  }
+}

@@ -23,30 +23,15 @@ from urllib.parse import urlparse, parse_qs
 from config import load_config
 from affect_engine import AffectState, affect, _decay_toward
 from arbiter import (Candidate, build_request, select_score, affect_mod, map_event, fan_tier,
-                     APPRAISAL_TABLE, importance_of, booster)
+                     APPRAISAL_TABLE, EMOTION_APPRAISAL, importance_of, booster, fan_applies)
 from expression import express
 from engine import speech_primary
 from understanding import understand, warmup_embed
+from fan_tagger import fan_signal, expand_follow_targets, TEAM_ROSTER, warmup_emotion_model
+TEAM_LIST = sorted(TEAM_ROSTER.keys())
 import chat
 
 CFG = load_config(os.path.join(os.path.dirname(__file__), "character.json"))
-KINDS = ["greeting", "smalltalk", "game_positive", "game_negative",
-         "user_distress", "compliment", "insult", "goal_follow_nudge"]
-
-
-# ---- 메시지 키워드 → kind 자동 분류 -----------------------------------------
-_KEYWORDS = [
-    ("insult",           ["바보", "멍청", "꺼져", "닥쳐", "못생", "미워", "재수", "한심", "찌질"]),
-    ("compliment",       ["고마", "멋지", "멋있", "예뻐", "예쁘", "최고", "잘했", "대단", "사랑",
-                          "좋아해", "귀여", "짱", "고생했"]),
-    ("user_distress",    ["짜증", "힘들", "힘드", "우울", "슬퍼", "슬프", "화나", "열받", "지쳐",
-                          "지친", "속상", "스트레스", "죽겠", "빡쳐", "눈물", "외로", "포기"]),
-    ("game_positive",    ["이겼", "이김", "우승", "바론", "드래곤", "에이스", "역전승", "캐리", "승리", "꿀잼"]),
-    ("game_negative",    ["졌", "패배", "던졌", "짤려", "트롤", "망했", "역전패", "지고"]),
-    ("goal_follow_nudge", ["팔로우", "팔로", "follow"]),
-    ("greeting",         ["안녕", "하이", "ㅎㅇ", "안뇽", "왔어", "또 왔", "잘 가", "잘가",
-                          "바이", "ㅂㅂ", "반가", "오랜만"]),
-]
 
 
 # ---- 실시간 델타: CSV 게임 이벤트 로딩 (변환 로직은 arbiter.map_event) -------
@@ -89,14 +74,6 @@ def event_view(d: dict, team: int) -> dict:
             "kind": k, "intensity": inten}
 
 
-def classify_kind(text: str) -> str:
-    t = (text or "").lower()
-    for kind, kws in _KEYWORDS:
-        if any(k.lower() in t for k in kws):
-            return kind
-    return "smalltalk"
-
-
 # 팬심 문서 7절 등급 → 한글 표시명 (누적 점수 기준, 강등 없음)
 _FAN_TIER_KO = {"rookie": "입문 팬", "follower": "동행 팬", "devoted": "열혈 팬",
                 "core": "코어 팬", "die_hard": "광팬"}
@@ -107,10 +84,8 @@ def fan_grade(score: float) -> str:
     return _FAN_TIER_KO[fan_tier(score)]
 
 
-def _payload_for(kind: str, text: str) -> dict:
-    if kind in ("game_positive", "game_negative"):
-        return {"team": "T1", "event": "바론", "text": text}
-    return {"text": text}
+def _game_payload() -> dict:
+    return {"team": "T1", "event": "바론"}
 
 
 # 대사는 LLM/문장 뱅크를 쓰지 않는다. affect engine 출력값을 JSON 으로 그대로 내보낸다.
@@ -125,7 +100,8 @@ def _stim_dict(st):
 
 
 def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
-               user_spoke: bool, dt: float = 1.0, fan: float = 0.0, fan_target: bool = True):
+               user_spoke: bool, dt: float = 1.0, fan: float = 0.0, fan_target: bool = True,
+               follow_target: set[str] | None = None):
     """-> (arbiter_log, affect_log, req, output, new_state, winners)"""
     prev = {"E": state.E, "A": state.A, "warmth": min(1.0, max(0.0, state.intimacy / 6.0))}
 
@@ -146,7 +122,8 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     req, winners, losers = build_request(
         char_id=cfg.name, turn_id=turn_id, tick=tick, candidates=pool,
         intimacy=state.intimacy, prev_affect={"E": state.E, "A": state.A},
-        fan=fan, fan_target=fan_target, prev_heat=state.heat, dt=dt,
+        fan=fan, fan_target=fan_target, follow_target=follow_target,
+        prev_heat=state.heat, dt=dt,
         cfg=cfg, user_spoke=user_spoke)
 
     pol = cfg.select_policy
@@ -161,18 +138,27 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     if req.state.fan_factor != 1.0:
         arb.append(f"   팬심 {req.state.fan_tier} → 팔로우팀(data) 자극 salience ×{req.state.fan_factor:.2f}")
 
+    def _base_imp_of(cand):
+        # 감정 kind 는 EMOTION_APPRAISAL, 그 외(경기·목표)는 APPRAISAL_TABLE
+        if cand.kind in EMOTION_APPRAISAL:
+            return EMOTION_APPRAISAL[cand.kind][1]
+        return APPRAISAL_TABLE.get(cand.kind, (0.0, 0.3))[1]
+
+    def _table_name(cand):
+        return "EMOTION_APPRAISAL" if cand.kind in EMOTION_APPRAISAL else "APPRAISAL_TABLE"
+
     def stim_line(tag, st, cand):
         if st is None:
             arb.append(f"   {tag}: (없음)")
             return
         arb.append(f"   {tag}: type={st.type:<6} src={st.source} tags={st.tags}")
-        # valence — 이벤트 종류별 고정 부호값 (표 조회, 변형 없음)
-        arb.append(f"      valence  = {st.valence:+.2f}   ← APPRAISAL 표 '{cand.kind}' 고정값 (변형 없음)")
-        # salience — importance × booster × 팬심배율(data 자극 한정)
-        base_imp = APPRAISAL_TABLE.get(cand.kind, (0.0, 0.3))[1]
+        # valence — 감정/이벤트 종류별 고정 부호값 (표 조회, 변형 없음)
+        arb.append(f"      valence  = {st.valence:+.2f}   ← {_table_name(cand)} '{cand.kind}' 고정값 (변형 없음)")
+        # salience — importance × booster × 팬심배율(fan_applies 대상)
+        base_imp = _base_imp_of(cand)
         imp = importance_of(cand)          # = base_imp × 세기
         bst = booster(cand)                # bounty/멀티킬 부스터
-        ff = req.state.fan_factor if st.type == "data" else 1.0
+        ff = req.state.fan_factor if fan_applies(cand, follow_target) else 1.0
         parts = f"importance {imp:.3f} × booster {bst:.2f}"
         if ff != 1.0:
             parts += f" × 팬심 ×{ff:.2f}"
@@ -207,14 +193,16 @@ def trace_turn(state: AffectState, pool: list, cfg, turn_id: str, tick: int,
     def stim_view(slot, st, cand):
         if st is None or cand is None:
             return None
-        base_imp = APPRAISAL_TABLE.get(cand.kind, (0.0, 0.3))[1]
-        ff = req.state.fan_factor if st.type == "data" else 1.0
+        base_imp = _base_imp_of(cand)
+        applies = fan_applies(cand, follow_target)
+        ff = req.state.fan_factor if applies else 1.0
         return {
             "slot": slot, "kind": cand.kind, "type": st.type, "source": st.source,
             "valence": round(st.valence, 3), "salience": round(st.salience, 4),
+            "table": _table_name(cand),
             "sal": {"base_imp": round(base_imp, 2), "intensity": round(cand.intensity, 2),
                     "importance": round(importance_of(cand), 3), "booster": round(booster(cand), 2),
-                    "fan_factor": round(ff, 2), "fan_applies": (st.type == "data" and ff != 1.0)},
+                    "fan_factor": round(ff, 2), "fan_applies": (applies and ff != 1.0)},
         }
 
     if req.primary is None:
@@ -315,8 +303,8 @@ def compute(q: dict) -> dict:
         game = q["game"][0] if has("game") and q["game"][0] not in ("", "(없음)") else None
         gint = fv("gint", 0.7)
         delta_label = f"합성 {game}" if game else None
-    # 팔로잉
-    following = ["T1"] if (has("following") and q["following"][0] == "1") else []
+    # 팔로잉 — following 은 다중값 파라미터(팀 정규화이름들). 예: following=T1&following=Gen.G
+    following = q.get("following", []) if has("following") else []
     # 열기 (match heat, 경기 열기 시작값)
     heat = fv("heat", 0.0) if has("heat") else 0.0
     # 어펙트 상태값
@@ -326,16 +314,32 @@ def compute(q: dict) -> dict:
     state = AffectState(E=E, A=A, heat=heat, intimacy=intimacy)
     expr = express(state)              # 입력 상태의 표현 (상단 표시용)
 
+    # ── 요청이해 (Understanding + FanTagger) — text 있으면 먼저 실행 ────────
+    # FanSignal 을 그대로 Arbiter 입력으로 씀 (B안, LLM 없이 감정 기반 valence·salience 도출)
+    ft_set = expand_follow_targets(following) if following else None
+    u = None
+    sig = None
+    if text is not None:
+        u = understand(text)
+        sig = fan_signal(text, u.intent, follow_target=ft_set)
+
     # ── 후보 풀 (소스층 → Arbiter 입력) ───────────────────────────────────
     pool = []
     primary_kind = None
     user_spoke = text is not None
-    if text is not None:
-        primary_kind = classify_kind(text) if auto else q.get("kind", ["smalltalk"])[0]
-        pool.append(Candidate(primary_kind, 0.7, source="user",
-                              payload=_payload_for(primary_kind, text)))
+    if sig is not None:
+        # emotion 라벨을 그대로 kind 로. intensity = emotion_conf (raw prob).
+        primary_kind = sig.emotion
+        pool.append(Candidate(
+            sig.emotion, sig.emotion_conf, source="user",
+            payload={
+                "text": text, "entities": sig.entities,
+                "polarity": sig.polarity, "emotion": sig.emotion,
+                "fan_category": sig.fan_category,
+            },
+        ))
     if game:
-        pool.append(Candidate(game, gint, source="delta", payload=_payload_for(game, "")))
+        pool.append(Candidate(game, gint, source="delta", payload=_game_payload()))
     # 목표 엔진: 팔로잉 없음 + (친밀도<0.5 or 팬심 낮음=rookie) → 팔로우 유도
     goal_fired = False
     if not following and (intimacy < 0.5 or fan_tier(fan) == "rookie"):
@@ -351,7 +355,8 @@ def compute(q: dict) -> dict:
     turn_id = "t_pg"
     tick = int(fv("tick", 0))
     arbiter_log, affect_log, req, output, next_state, winners, arbiter_view, affect_view = \
-        trace_turn(state, pool, CFG, turn_id, tick, user_spoke, fan=fan, fan_target=fan_target)
+        trace_turn(state, pool, CFG, turn_id, tick, user_spoke,
+                   fan=fan, fan_target=fan_target, follow_target=ft_set)
     trace_result = {"E": output.E, "A": output.A, "heat": round(next_state.heat, 3)}
 
     # ── 대사 = affect engine 출력 (JSON, LLM 0) ───────────────────────────
@@ -400,7 +405,8 @@ def compute(q: dict) -> dict:
     row(has("intimacy"), "친밀도", f"{intimacy:.1f}" if has("intimacy") else "(미입력→0)")
     # row(has("onto"), "온톨로지", f'"{onto}" (표시용·미연결)' if has("onto") else "(미입력)")   # 온톨로지 토픽 비활성(주석처리)
     row(game is not None, "온톨로지 실시간데이터", f"{delta_label} → {game} (강도 {gint:.2f})" if game else "(미입력/없음)")
-    row(has("following"), "팔로잉", ("팔로우함" if following else "팔로우 안 함") if has("following") else "(미입력→없음)")
+    row(bool(following), "팔로잉",
+        (", ".join(following) if following else "팔로우 팀 없음") if has("following") else "(미입력→없음)")
     # 비활성(주석처리): 열기 / 정서 E / 세기 A 소스층 요약 행
     # row(has("heat"), "열기(경기)", f"{heat:.2f}" if has("heat") else "(미입력→0)")
     # row(has("E"), "정서 E", f"{E:+.2f}" if has("E") else "(미입력→0)")
@@ -410,14 +416,33 @@ def compute(q: dict) -> dict:
 
     stage, stage_dir = chat._intimacy_stage(intimacy)
 
-    # ── 요청이해 (Understanding) — 노션 plan §2 룰. text 있을 때만 추출 ──────
-    if text:
-        u = understand(text)
+    # ── 요청이해 (Understanding + FanTagger) view — 위에서 이미 실행한 값 활용 ──
+    # 도출값(arbiter_derive): B안 검증용 — FanSignal 이 아비터에 어떻게 흘러들어가는지 노출
+    if u is not None and sig is not None:
+        emo_v, emo_imp = EMOTION_APPRAISAL[sig.emotion]
+        derive_ents_set = set(sig.entities)
+        fan_applies_ = bool(ft_set) and bool(derive_ents_set & ft_set)
         understanding_view = {
             "text": u.text, "phase": u.phase, "segment": u.segment,
             "intent": u.intent, "confidence": u.confidence,
             "needs_new_context": u.needs_new_context,
             "intent_source": u.intent_source,
+            # 감성 태깅 — 노션 '감성 태깅' 문서 §2·6
+            "emotion": sig.emotion, "polarity": sig.polarity,
+            "emotion_conf": sig.emotion_conf, "emotion_source": sig.emotion_source,
+            "entities": sig.entities, "fan_category": sig.fan_category,
+            "fan_delta": sig.fan_delta, "fan_points": sig.fan_points,
+            "follow_target": sorted(ft_set) if ft_set else None,
+            # ── 아비터 도출값 (B안 검증용) ──
+            "arbiter_derive": {
+                "kind": sig.emotion,             # Candidate.kind = emotion 라벨
+                "valence": round(emo_v, 3),      # EMOTION_APPRAISAL[emotion][0]
+                "base_importance": round(emo_imp, 3),  # EMOTION_APPRAISAL[emotion][1]
+                "intensity": round(sig.emotion_conf, 3),   # = emotion_conf
+                "importance": round(emo_imp * sig.emotion_conf, 3),   # base × intensity
+                "fan_applies": fan_applies_,     # entities ∩ follow_target
+                "entities_matched": sorted(derive_ents_set & ft_set) if ft_set else [],
+            },
         }
     else:
         understanding_view = None
@@ -465,7 +490,7 @@ def compute_batch(q: dict) -> dict:
             continue
         v = event_view(EVENTS_RAW[idx], team)
         game, gint = v["kind"], v["intensity"]
-        pool = [Candidate(game, gint, source="delta", payload=_payload_for(game, ""))]
+        pool = [Candidate(game, gint, source="delta", payload=_game_payload())]
         _al, _fl, _req, output, next_state, _win, _av, affect_view = trace_turn(
             state, pool, CFG, f"t_b{i}", i, user_spoke=False, fan=fan, fan_target=fan_target)
         integ = affect_view["integrate"][0] if affect_view["integrate"] else {}
@@ -542,6 +567,34 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
   .usrc.rule{background:#2ea04333;color:#3fb950;border:1px solid #2ea04355}
   .usrc.embed{background:#8957e533;color:#d2a8ff;border:1px solid #a371f755}
   .usrc.none{background:#6e768133;color:#8b949e;border:1px solid #6e768155}
+  /* ── 감성 태깅 (요청이해 카드 안) ── */
+  .usubhd{margin-top:4px;padding-top:10px;border-top:1px dashed #21262d;color:#f0883e;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}
+  .usubhd small{color:#6e7681;font-weight:400;text-transform:none;letter-spacing:0;margin-left:6px}
+  .pol{font-size:11px;padding:2px 9px;border-radius:999px;font-weight:700;letter-spacing:.02em}
+  .pol.positive{background:#2ea04333;color:#3fb950;border:1px solid #2ea04355}
+  .pol.negative{background:#f8514933;color:#f85149;border:1px solid #f8514955}
+  .pol.neutral{background:#6e768133;color:#8b949e;border:1px solid #6e768155}
+  .arousal{font-size:10px;padding:1px 7px;border-radius:4px;color:#8b949e;background:#21262d;letter-spacing:.02em}
+  .arousal.strong{background:#f0883e33;color:#f0883e;font-weight:700}
+  .ent{display:inline-block;font-size:11px;padding:2px 10px;border-radius:999px;background:#0e1116;border:1px solid #30363d;color:#e6edf3;margin-right:5px;font-weight:600}
+  .fcat{font-size:11px;padding:3px 10px;border-radius:6px;font-weight:700;letter-spacing:.02em}
+  .fcat.strong_reaction{background:#8957e533;color:#d2a8ff;border:1px solid #a371f755}
+  .fcat.muse_question{background:#f0883e33;color:#f0883e;border:1px solid #f0883e55}
+  .fcat.mention{background:#1f6feb33;color:#79c0ff;border:1px solid #1f6feb55}
+  .fcat.strong_reaction_soft{background:#8957e51a;color:#a371f7cc;border:1px dashed #a371f755}
+  .fcat.muse_question_soft{background:#f0883e1a;color:#f0883ecc;border:1px dashed #f0883e55}
+  .fcat.mention_soft{background:#1f6feb1a;color:#79c0ffcc;border:1px dashed #1f6feb55}
+  .fcat.none{background:#6e768133;color:#8b949e;border:1px solid #6e768155}
+  .fdeltachip{display:inline-block;font-size:11px;padding:2px 10px;border-radius:999px;font-weight:700;margin-right:5px}
+  .fdeltachip.pos{background:#2ea04333;color:#3fb950;border:1px solid #2ea04355}
+  .fdeltachip.neg{background:#f8514933;color:#f85149;border:1px solid #f8514955}
+  .uval.big.pos{color:#3fb950}.uval.big.neg{color:#f85149}
+  /* ── 팀 다중선택 그리드 (팔로잉 컨트롤) ── */
+  .teamgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));gap:5px;margin-top:6px}
+  .teamchip{display:inline-flex;align-items:center;justify-content:center;gap:4px;font-size:11px;padding:5px 7px;border-radius:6px;background:#0e1116;border:1px solid #30363d;color:#adbac7;cursor:pointer;user-select:none;font-weight:600}
+  .teamchip input{margin:0;accent-color:#58a6ff;transform:scale(.9)}
+  .teamchip:has(input:checked){background:#1f6feb1a;border-color:#58a6ff;color:#e6edf3}
+  .teamchip.disabled{opacity:.4;pointer-events:none}
   .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin:0 0 9px}
   .card.arb h2{color:#58a6ff}.card.aff h2{color:#d2a8ff}.card.src h2{color:#3fb950}
   pre{margin:0;white-space:pre-wrap;font:12.5px/1.6 ui-monospace,Menlo,monospace;color:#adbac7}
@@ -643,8 +696,8 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
       선택 이벤트부터 <input type=number id=batchn min=1 max=60 value=12 style="width:56px;margin:0;padding:3px 5px;display:inline-block"> 개 연속
       <button id=batchrun style="width:auto;margin:0 0 0 auto;padding:4px 10px;background:#8957e5;border-color:#a371f7;color:#fff;font-weight:700">▶ 배치</button></div></div>
 
-  <div class=src><div class=top><input type=checkbox class=use id=use_following checked><label>팔로잉</label></div>
-    <div class=sub2><input type=checkbox id=following><label for=following style="font-weight:400">팀 팔로우함</label></div></div>
+  <div class=src><div class=top><input type=checkbox class=use id=use_following checked><label>팔로잉 (팀 다중선택)</label></div>
+    <div class=teamgrid id=teamgrid></div></div>
 
   <!-- 비활성(주석처리): 열기 (경기 heat)
   <div class=src><div class=top><input type=checkbox class=use id=use_heat checked><label>열기 (경기 heat)</label><span class=v id=heatv></span></div>
@@ -688,13 +741,25 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
 
   <div class="card src"><h2>소스층 입력 요약 (이번 SEND)</h2><pre id=srclog></pre></div>
 
-  <div class="card understand"><h2>요청이해 (Understanding) <span style="float:right;font-weight:400;text-transform:none;color:#8b949e">노션 plan §2</span></h2>
+  <div class="card understand"><h2>요청이해 (Understanding) <span style="float:right;font-weight:400;text-transform:none;color:#8b949e">노션 plan §2 · 감성 §2·6</span></h2>
     <div class=uview>
       <div class=urow><span class=ulab>원문</span><span class=uval id=u_text>—</span></div>
       <div class=urow><span class=ulab>intent</span><span class="uval big" id=u_intent>none</span><span class="usrc" id=u_intent_src></span><span class=umuted id=u_intent_conf></span></div>
       <div class=urow><span class=ulab>segment</span><span class=uval id=u_seg>—</span><span class=umuted id=u_seg_conf></span></div>
       <div class=urow><span class=ulab>phase</span><span class=uval id=u_phase>—</span><span class=umuted>서버 주입값 (텍스트 추론 안 함)</span></div>
       <div class=urow><span class=ulab>needs_new_context</span><span class=uval id=u_nnc>—</span></div>
+      <div class=usubhd>감성 태깅 <small>노션 감성 §2·6</small></div>
+      <div class=urow><span class=ulab>emotion</span><span class="uval big" id=u_emo>—</span><span class="usrc" id=u_emo_src></span><span class="pol" id=u_pol></span><span class="arousal" id=u_arousal></span><span class=umuted id=u_emo_conf></span></div>
+      <div class=urow><span class=ulab>entities</span><span class=uval id=u_ents>—</span></div>
+      <div class=urow><span class=ulab>fan_category</span><span class="fcat" id=u_fcat>—</span></div>
+      <div class=urow><span class=ulab>fan_delta</span><span class=uval id=u_fdelta>—</span></div>
+      <div class=urow><span class=ulab>fan_points</span><span class="uval big" id=u_fpts>—</span><span class=umuted id=u_fpts_note></span></div>
+      <div class=usubhd>→ 아비터로 넘길 값 <small>B안 · FanSignal 직결 (LLM 없이 감정→수치 도출)</small></div>
+      <div class=urow><span class=ulab>kind</span><span class=uval id=u_arb_kind>—</span><span class=umuted>Candidate.kind = emotion 라벨</span></div>
+      <div class=urow><span class=ulab>valence</span><span class="uval big" id=u_arb_val>—</span><span class=umuted id=u_arb_val_note></span></div>
+      <div class=urow><span class=ulab>importance</span><span class=uval id=u_arb_imp>—</span><span class=umuted id=u_arb_imp_note></span></div>
+      <div class=urow><span class=ulab>intensity</span><span class=uval id=u_arb_int>—</span><span class=umuted>= emotion_conf (모델 raw prob)</span></div>
+      <div class=urow><span class=ulab>fan_factor</span><span class=uval id=u_arb_fan>—</span><span class=umuted id=u_arb_fan_note></span></div>
     </div></div>
 
   <div class=grid2>
@@ -714,7 +779,7 @@ HTML = """<!doctype html><html lang=ko><meta charset=utf-8>
  </div>
 </div>
 <script>
-const KINDS = __KINDS__;
+const TEAMS = __TEAMS__;
 const $=id=>document.getElementById(id);
 // 비활성(주석처리): 유저발화 kind 드롭다운 / 합성 게임 드롭다운 초기화
 // KINDS.forEach(k=>{const o=document.createElement('option');o.value=o.textContent=k;if(k==='user_distress')o.selected=true;$('kind').appendChild(o)});
@@ -733,6 +798,28 @@ function loadEvents(){
 }
 $('team').addEventListener('change',()=>{loadEvents();dirty();});
 loadEvents();
+// 팀 팔로잉 그리드 초기화 — TEAMS(=서버가 로드한 entities.json 팀 리스트) 로 렌더.
+// 기본값: T1 만 체크 (기존 SEND 동작 유지). use_following 언체크 시 팀 그리드 비활성.
+(function initTeamGrid(){
+  const grid=$('teamgrid');
+  TEAMS.forEach(t=>{
+    const lbl=document.createElement('label');
+    lbl.className='teamchip';
+    const cb=document.createElement('input');
+    cb.type='checkbox';cb.className='followteam';cb.value=t;
+    if(t==='T1')cb.checked=true;
+    cb.addEventListener('change',dirty);
+    const span=document.createElement('span');span.textContent=t;
+    lbl.appendChild(cb);lbl.appendChild(span);
+    grid.appendChild(lbl);
+  });
+  function syncUseFollow(){
+    const on=$('use_following').checked;
+    grid.querySelectorAll('.teamchip').forEach(el=>el.classList.toggle('disabled',!on));
+  }
+  $('use_following').addEventListener('change',()=>{syncUseFollow();dirty();});
+  syncUseFollow();
+})();
 
 const COLOR={warm:'#f0883e',cool:'#58a6ff'};
 let lastResult=null;
@@ -885,11 +972,72 @@ function render(d){
     $('u_phase').textContent=u.phase;
     $('u_nnc').textContent=u.needs_new_context?'true (다음 레이어 재확인 필요)':'false';
     $('u_nnc').style.color=u.needs_new_context?'#f85149':'#3fb950';
+    // 감성 태깅 — emotion 값을 크게, polarity/arousal 은 배지로
+    $('u_emo').textContent=u.emotion;
+    $('u_emo').style.color=u.emotion==='neutral'?'#6e7681':'#f0883e';
+    const esrc=u.emotion_source||'unavailable';
+    const eLabel={model:'MODEL',model_below_threshold:'MODEL (low conf)',
+                  unavailable:'—',embed:'EMBED',embed_below_threshold:'EMBED (low)'}[esrc]||esrc;
+    $('u_emo_src').textContent=eLabel;
+    const srcClass=(esrc==='model'||esrc==='embed')?'rule':'none';
+    $('u_emo_src').className='usrc '+srcClass;
+    const polSym={positive:'+ positive',negative:'− negative',neutral:'○ neutral'}[u.polarity];
+    $('u_pol').textContent=polSym;$('u_pol').className='pol '+u.polarity;
+    const strong=['excitement','anger','surprise'].includes(u.emotion);
+    const arousal=strong?'강함':((u.emotion==='confusion'||u.emotion==='neutral')?'낮음':'보통');
+    $('u_arousal').textContent='arousal '+arousal;
+    $('u_arousal').className='arousal '+(strong?'strong':'');
+    $('u_emo_conf').textContent='conf '+u.emotion_conf.toFixed(2);
+    $('u_ents').innerHTML=u.entities.length
+      ? u.entities.map(e=>'<span class=ent>'+esc(e)+'</span>').join('')
+      : '<span class=umuted>—</span>';
+    $('u_fcat').textContent=u.fan_category;
+    $('u_fcat').className='fcat '+u.fan_category;
+    const dks=Object.keys(u.fan_delta);
+    $('u_fdelta').innerHTML=dks.length
+      ? dks.map(k=>{const s=u.fan_delta[k];return `<span class="fdeltachip ${s==='+'?'pos':'neg'}">${esc(k)} ${s}</span>`}).join('')
+      : '<span class=umuted>— (중립 또는 엔티티 없음)</span>';
+    const pts=u.fan_points;
+    $('u_fpts').textContent=(pts>0?'+':'')+pts;
+    $('u_fpts').className='uval big '+(pts>0?'pos':pts<0?'neg':'');
+    const noteBits=[];
+    if(u.follow_target&&u.follow_target.length) noteBits.push('follow_target=['+u.follow_target.join(', ')+']');
+    else noteBits.push('팔로우 팀 없음 → 언급된 엔티티에 소프트 점수만 (30%)');
+    if(u.fan_category.endsWith('_soft')) noteBits.push('소프트 신호 (엔티티가 팔로우 대상 아님)');
+    $('u_fpts_note').textContent=noteBits.join(' · ');
+    // ── 아비터 도출값 (B안 검증용) — FanSignal 을 어떻게 valence/salience 로 뽑는지 노출
+    const d=u.arbiter_derive;
+    $('u_arb_kind').textContent=d.kind;
+    $('u_arb_val').textContent=sgn(d.valence);
+    $('u_arb_val').style.color=d.valence>0?'#3fb950':(d.valence<0?'#f85149':'#8b949e');
+    $('u_arb_val_note').textContent=`← EMOTION_APPRAISAL['${d.kind}'][0] (polarity 부호별 고정값 · 감정 세기는 importance 로 흡수)`;
+    $('u_arb_imp').textContent=d.importance.toFixed(3);
+    $('u_arb_imp_note').textContent=`= base_imp ${d.base_importance.toFixed(2)} × intensity ${d.intensity.toFixed(2)}`;
+    $('u_arb_int').textContent=d.intensity.toFixed(3);
+    if(d.fan_applies){
+      $('u_arb_fan').textContent='적용 ✓';
+      $('u_arb_fan').style.color='#3fb950';
+      $('u_arb_fan_note').textContent=`엔티티 [${d.entities_matched.join(', ')}] ∈ follow_target → salience × 팬심배율`;
+    }else{
+      $('u_arb_fan').textContent='미적용';
+      $('u_arb_fan').style.color='#8b949e';
+      const reason=u.follow_target&&u.follow_target.length
+        ?'언급 엔티티가 팔로우 대상과 겹치지 않음':'팔로우 팀 없음';
+      $('u_arb_fan_note').textContent=reason;
+    }
   }else{
-    ['u_text','u_intent','u_seg','u_phase','u_nnc'].forEach(id=>$(id).textContent='—');
-    $('u_intent').style.color='#6e7681';
-    $('u_intent_conf').textContent='';$('u_seg_conf').textContent='';
+    ['u_text','u_intent','u_seg','u_phase','u_nnc','u_emo','u_ents','u_fcat','u_fdelta','u_fpts',
+     'u_arb_kind','u_arb_val','u_arb_imp','u_arb_int','u_arb_fan'].forEach(id=>$(id).textContent='—');
+    $('u_intent').style.color='#6e7681';$('u_emo').style.color='#6e7681';
+    $('u_arb_val').style.color='';$('u_arb_fan').style.color='';
+    $('u_intent_conf').textContent='';$('u_seg_conf').textContent='';$('u_emo_conf').textContent='';
     $('u_intent_src').textContent='';$('u_intent_src').className='usrc';
+    $('u_emo_src').textContent='';$('u_emo_src').className='usrc';
+    $('u_pol').textContent='';$('u_pol').className='pol';
+    $('u_arousal').textContent='';$('u_arousal').className='arousal';
+    $('u_fcat').className='fcat';$('u_fpts').className='uval big';
+    $('u_fpts_note').textContent='';
+    $('u_arb_val_note').textContent='';$('u_arb_imp_note').textContent='';$('u_arb_fan_note').textContent='';
     $('u_nnc').style.color='';
   }
   $('arb').innerHTML=renderArb(d.arbiter_view);
@@ -910,7 +1058,9 @@ function run(){
   if($('use_intimacy').checked)P.set('intimacy',$('intimacy').value);
   // if($('use_onto').checked)P.set('onto',$('onto').value);   // 온톨로지 토픽 비활성(주석처리)
   if($('use_game').checked){P.set('evt',$('evt').value);P.set('team',$('team').value);/* 합성 game/gint 비활성 */}
-  if($('use_following').checked)P.set('following',$('following').checked?'1':'0');
+  if($('use_following').checked){
+    document.querySelectorAll('input.followteam:checked').forEach(el=>P.append('following',el.value));
+  }
   // if($('use_heat').checked)P.set('heat',$('heat').value);
   // if($('use_E').checked)P.set('E',$('E').value);
   // if($('use_A').checked)P.set('A',$('A').value);
@@ -995,7 +1145,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            html = (HTML.replace("__KINDS__", json.dumps(KINDS, ensure_ascii=False))
+            html = (HTML.replace("__TEAMS__", json.dumps(TEAM_LIST, ensure_ascii=False))
                         .replace("__CHAR__", CFG.name).replace("__ARCH__", CFG.archetype))
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
         elif parsed.path == "/api/events":
@@ -1024,6 +1174,9 @@ if __name__ == "__main__":
     # 요청이해 임베딩 폴백 프리로드 — 첫 요청 스톨 방지 (미설치 시 자동 스킵)
     print("  요청이해 임베딩(e5-small) 로드…", end="", flush=True)
     print(" ok" if warmup_embed() else " 스킵 (rule-only 모드)")
+    # 감정 분류 모델 프리로드 — SamLowe/roberta-base-go_emotions (초기 다운로드 ~500MB)
+    print("  감정 분류(GoEmotions RoBERTa) 로드…", end="", flush=True)
+    print(" ok" if warmup_emotion_model() else " 스킵 (neutral 다운그레이드)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

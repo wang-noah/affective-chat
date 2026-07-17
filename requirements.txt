@@ -4,5 +4,12 @@ requests>=2.31
 
 # 요청이해 층 임베딩 폴백 — 룰이 놓친 오타/유의어 발화 잡기.
 # 미설치 시 rule-only 로 자동 다운그레이드 (playground 는 정상 동작).
-# multilingual-e5-small 118MB 모델 + torch (~200MB) 다운로드 필요.
+# multilingual-e5-small ~118MB 모델 + torch (~200MB) 다운로드 필요.
 sentence-transformers>=2.7
+
+# 감정 분류 — SamLowe/roberta-base-go_emotions-onnx (int8 양자화, ~120MB).
+# transformers 는 tokenizer 용, 모델 추론은 onnxruntime 세션.
+# 미설치 시 neutral 로 다운그레이드 (fan_signal 계약 유지).
+transformers>=4.30
+onnxruntime>=1.16
+huggingface-hub>=0.20

@@ -78,21 +78,37 @@ class AffectRequest:
 
 # ===========================================================================
 # Appraisal — 자극종류 → (valence, importance)
-#   원래 affect_engine 에 있던 APPRAISAL_TABLE 을 Arbiter 가 흡수했다.
-#   "이벤트종류 → importance / valence" 는 변환(Arbiter)의 책임이기 때문.
+#   두 테이블로 나뉜다:
+#     EMOTION_APPRAISAL : FanTagger 9-class 감정(텍스트 자극) — polarity·arousal 기반
+#     APPRAISAL_TABLE   : 경기 이벤트(data)·목표 자극 — 이벤트종류 고정값
+#   valence 는 polarity 부호별 고정값(경기 이벤트와 동일 스케일):
+#     positive → +0.60, negative → −0.55, neutral → 0.00.
+#   감정 '세기' 차이는 valence 크기가 아니라 base_importance(arousal 계급)로 표현한다:
+#     strong(excitement·anger·surprise) 0.85, mid(joy·irritation·sadness·disappointment) 0.55,
+#     low(confusion·neutral) 0.25. → salience 에 자동 반영.
 # ===========================================================================
+EMOTION_APPRAISAL: dict[str, tuple[float, float]] = {
+    # arousal_strong (excitement · anger · surprise) → importance 0.85
+    "excitement":     ( 0.60, 0.85),      # positive
+    "surprise":       ( 0.60, 0.85),      # positive (부정 놀람은 anger 로 흡수됨 §POLARITY_MAP)
+    "anger":          (-0.55, 0.85),      # negative
+    # arousal_mid (joy · irritation · sadness · disappointment) → importance 0.55
+    "joy":            ( 0.60, 0.55),      # positive
+    "irritation":     (-0.55, 0.55),      # negative
+    "sadness":        (-0.55, 0.55),      # negative
+    "disappointment": (-0.55, 0.55),      # negative
+    # arousal_low (confusion · neutral) → importance 0.25
+    "confusion":      ( 0.00, 0.25),      # neutral (POLARITY_MAP)
+    "neutral":        ( 0.00, 0.25),      # neutral
+}
+
 APPRAISAL_TABLE: dict[str, tuple[float, float]] = {
-    "greeting":          ( 0.30, 0.20),
-    "smalltalk":         ( 0.05, 0.30),
     "game_positive":     ( 0.60, 0.85),
     "game_negative":     (-0.55, 0.80),
-    "user_distress":     (-0.15, 0.55),
-    "compliment":        ( 0.50, 0.50),
-    "insult":            (-0.60, 0.70),
     "goal_follow_nudge": ( 0.10, 0.30),
 }
 
-SOCIAL_KINDS = {"greeting", "smalltalk", "compliment", "user_distress", "goal_follow_nudge"}
+SOCIAL_KINDS = set(EMOTION_APPRAISAL.keys())    # 텍스트(감정) 자극
 DATA_KINDS = {"game_positive", "game_negative"}
 
 
@@ -107,15 +123,21 @@ def stim_type(c: Candidate) -> str:
     return "system"
 
 
+def _appraise(c: Candidate) -> tuple[float, float]:
+    """(valence, base_importance) 룩업 — 감정 우선, 없으면 경기·목표 표."""
+    if c.kind in EMOTION_APPRAISAL:
+        return EMOTION_APPRAISAL[c.kind]
+    return APPRAISAL_TABLE.get(c.kind, (0.0, 0.3))
+
+
 def valence_of(c: Candidate) -> float:
-    """-1~1. data 는 map_event 가 이미 팀→부호를 풀어 kind 로 넘겨준다."""
-    return APPRAISAL_TABLE.get(c.kind, (0.0, 0.3))[0]
+    """-1~1. 감정 kind 는 EMOTION_APPRAISAL, 경기 이벤트는 map_event 가 팀→부호 풀어 kind 결정."""
+    return _appraise(c)[0]
 
 
 def importance_of(c: Candidate) -> float:
-    """이벤트종류 importance × 자극 세기."""
-    base_imp = APPRAISAL_TABLE.get(c.kind, (0.0, 0.3))[1]
-    return base_imp * c.intensity
+    """이벤트종류 importance × 자극 세기(intensity)."""
+    return _appraise(c)[1] * c.intensity
 
 
 def booster(c: Candidate) -> float:
@@ -130,11 +152,19 @@ def booster(c: Candidate) -> float:
 
 
 def tags_for(c: Candidate) -> list[str]:
-    """템플릿 선택용 라벨. 실제 문구는 3층(컨텍스트 조립)이 채운다."""
+    """템플릿 선택용 라벨. 실제 문구는 3층(컨텍스트 조립)이 채운다.
+    텍스트 자극은 FanTagger 부가정보(polarity·fan_category·entities)도 tags 로 흘림."""
     tags = [c.kind]
+    p = c.payload
     for k in ("event", "team", "killType", "monsterType"):
-        if c.payload.get(k):
-            tags.append(str(c.payload[k]))
+        if p.get(k):
+            tags.append(str(p[k]))
+    if p.get("polarity"):
+        tags.append(f"polarity:{p['polarity']}")
+    if p.get("fan_category") and p["fan_category"] != "none":
+        tags.append(f"cat:{p['fan_category']}")
+    for e in (p.get("entities") or []):
+        tags.append(f"ent:{e}")
     return tags
 
 
@@ -184,6 +214,11 @@ def fan_factor(cumulative: float) -> float:
     return FAN_FACTOR[fan_tier(cumulative)]
 
 
+# mood-congruent 부스터 대상 — EMOTION_APPRAISAL 부호로 자동 파생 (감정 kind + 경기 kind)
+_POSITIVE_MOOD_KINDS = {"game_positive"} | {k for k, (v, _) in EMOTION_APPRAISAL.items() if v > 0}
+_NEGATIVE_MOOD_KINDS = {"game_negative"} | {k for k, (v, _) in EMOTION_APPRAISAL.items() if v < 0}
+
+
 def affect_mod(kind: str, prev: dict) -> float:
     """직전 감정(prev_affect)이 '무엇에 끌리는가'를 변조 = 되먹임 통로.
     Affect 안이 아니라 Arbiter 에서, 지난 턴 결과로 계산한다(턴 내 순환 없음)."""
@@ -194,9 +229,10 @@ def affect_mod(kind: str, prev: dict) -> float:
     if kind in SOCIAL_KINDS:
         m *= 0.4 + 0.6 * warmth
     # mood-congruent: 기분 좋을 땐 긍정 자극, 나쁠 땐 부정 자극에 더 끌림
-    if kind in ("game_positive", "compliment", "greeting"):
+    # 감정 라벨(excitement/joy/anger/…) + 경기(game_positive/negative) 모두 반영
+    if kind in _POSITIVE_MOOD_KINDS:
         m *= 1.0 + 0.3 * max(0.0, E)
-    if kind in ("game_negative", "insult"):
+    if kind in _NEGATIVE_MOOD_KINDS:
         m *= 1.0 + 0.3 * max(0.0, -E)
     return m
 
@@ -283,9 +319,24 @@ def match_heat_from(candidates: list[Candidate]) -> float:
     return round(min(1.0, sum(c.intensity for c in data) / len(data)), 3)
 
 
-def _to_stim(c: Candidate, cfg: PersonalityConfig, fan_factor: float = 1.0) -> Stim:
+def fan_applies(c: Candidate, follow_target: set[str] | None) -> bool:
+    """팬심 배율(fan_factor) 적용 대상인지.
+      - data : 경기 이벤트 (map_event 가 이미 팀→관점을 풀어 kind 로 넘김)
+      - social: 언급된 엔티티가 팔로우 대상(팀+선수)에 겹칠 때만
+    """
+    st = stim_type(c)
+    if st == "data":
+        return True
+    if st == "social" and follow_target:
+        ents = set(c.payload.get("entities") or [])
+        return bool(ents & follow_target)
+    return False
+
+
+def _to_stim(c: Candidate, cfg: PersonalityConfig, fan_factor: float = 1.0,
+             follow_target: set[str] | None = None) -> Stim:
     sal = appraisal_salience(c)
-    if stim_type(c) == "data":          # 팔로우팀 경기 이벤트에만 팬심 배율 적용
+    if fan_applies(c, follow_target):
         sal *= fan_factor
     return Stim(
         moment_id=c.moment_id or f"m_{c.kind}",
@@ -313,6 +364,7 @@ def build_request(
     match_heat: float | None = None,
     fan: float = 0.0,               # 누적 Fan심 (유저↔팔로우팀)
     fan_target: bool = True,        # 팔로우팀이 있는가 (=팔로잉; 팬심 가산+배율 대상)
+    follow_target: set[str] | None = None,   # 팔로잉 확장(팀+소속선수) — social 자극 fan_factor 게이팅
     prev_heat: float = 0.0,         # 직전 열기 (감쇠 기준)
     dt: float = 1.0,                # 열기 감쇠용 시간 간격
     seed: int | None = None,
@@ -327,8 +379,8 @@ def build_request(
     eff_fan = effective_fan(fan, fan_target)        # 팔로잉이 팬심을 끌어올림
     tier = fan_tier(eff_fan)
     ffac = fan_factor(eff_fan) if fan_target else 1.0   # 팔로우팀 없으면 증폭 안 함
-    primary = _to_stim(winners[0], cfg, ffac) if winners else None
-    secondary = _to_stim(winners[1], cfg, ffac) if len(winners) > 1 else None
+    primary = _to_stim(winners[0], cfg, ffac, follow_target) if winners else None
+    secondary = _to_stim(winners[1], cfg, ffac, follow_target) if len(winners) > 1 else None
 
     # 열기(match heat) 계산 — Arbiter 책임. 감쇠 후 팔로우팀 경기(data) 자극으로 가열.
     heat = prev_heat * math.exp(-cfg.decay_heat * dt)   # 조용하면 0 으로 식음

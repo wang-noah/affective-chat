@@ -13,11 +13,12 @@ import os
 
 from config import PersonalityConfig
 from affect_engine import AffectState
-from arbiter import Candidate
+from arbiter import Candidate, EMOTION_APPRAISAL
 from expression import Expression
 
-# 자유 발화 = 템플릿으로 못 막는 진짜 대화 -> LLM
-FREEFORM_KINDS = {"smalltalk", "user_distress", "chat_freeform"}
+# 자유 발화 = 유저 텍스트(감정 kind) — 템플릿 없음, LLM 로 흐름.
+# 감정 라벨은 arbiter.EMOTION_APPRAISAL 키셋과 일치.
+FREEFORM_KINDS = set(EMOTION_APPRAISAL.keys())
 
 # ---- T1 템플릿 (톤별 변주) ---------------------------------------------------
 TEMPLATES: dict[str, dict[str, list[str]]] = {
